@@ -1,81 +1,46 @@
-# VS-Code
-.vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-*.code-workspace
-
-
-# Local History for Visual Studio Code
-.history/
+# =========================
+# ESP-IDF build files
+# =========================
+build/
+build_*/
+**/build/
 
 # CMake
-.config
-*.o
-*.pyc
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
 
-# gtags
-GTAGS
-GRTAGS
-GPATH
+# Ninja
+.ninja_deps
+.ninja_log
 
-# emacs
-.dir-locals.el
+# sdkconfig backup
+sdkconfig.old
 
-# emacs temp file suffixes
-*~
-.#*
-\#*#
+# dependencies
+managed_components/
+dependencies.lock
 
-# eclipse setting
-.settings
+# ESP-IDF python env
+.venv/
+env/
 
-# MacOS directory files
+# VSCode
+.vscode/
+
+# macOS
 .DS_Store
 
-# Example project files
-examples/**/sdkconfig
-examples/**/sdkconfig.old
-examples/**/build
-
-# Doc build artifacts
-docs/*/_build/
-docs/*/doxygen-warning-log.txt
-docs/*/sphinx-warning-log.txt
-docs/*/sphinx-warning-log-sanitized.txt
-docs/*/xml/
-docs/*/xml_in/
-docs/*/man/
-docs/doxygen_sqlite3.db
-
-# Downloaded font files
-docs/_static/DejaVuSans.ttf
-docs/_static/NotoSansSC-Regular.otf
-
-# Unit test app files
-tools/unit-test-app/sdkconfig
-tools/unit-test-app/sdkconfig.old
-tools/unit-test-app/build
-tools/unit-test-app/builds
-tools/unit-test-app/output
-
-# IDF monitor test
-tools/test_idf_monitor/outputs
-
-TEST_LOGS
-
-# gcov coverage reports
-*.gcda
-*.gcno
-coverage.info
-coverage_report/
-
-test_multi_heap_host
-
-# Results for the checking of the Python coding style
-flake8_output.txt
-
-# ESP-IDF library 
-build
+# logs
 *.log
+
+# binaries
+*.bin
+*.elf
+*.map
+
+# flash files
+flasher_args.json
+partition-table.bin
+bootloader.bin

@@ -7,8 +7,16 @@
 void beacon_timeout(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
 {
     // 立刻停止电机
-    ESP_LOGE(TAG, "beacon_timeout, stopping motor");
-    esp_event_post_to(pr_events_loop_handle, PRM, PRM_STOP_EVENT, NULL, 0, portMAX_DELAY);
+    ESP_LOGE(TAG, "[PRM] beacon timeout -> post PRM_STOP_EVENT");
+    esp_err_t post_err = esp_event_post_to(pr_events_loop_handle, PRM, PRM_STOP_EVENT, NULL, 0, portMAX_DELAY);
+    if (post_err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "[PRM] beacon timeout post PRM_STOP_EVENT success");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "[PRM] beacon timeout post PRM_STOP_EVENT failed: %s", esp_err_to_name(post_err));
+    }
     return;
 }
 
@@ -41,53 +49,102 @@ static void PRM_event_handler(void *handler_args, esp_event_base_t event_base, i
     {
     case PRM_UNLOCK_EVENT:
     {
-        ESP_LOGI(TAG, "PRM_UNLOCK_EVENT");
+        ESP_LOGI(TAG, "[PRM] RX UNLOCK event_id=%ld", (long)event_id);
 
         err = motor_3508->unlock_motor(CONFIG_DEFAULT_MOTOR_ID);
+        ESP_LOGI(TAG, "[PRM] unlock_motor() -> %s", esp_err_to_name(err));
         // post PRM_UNLOCK_DONE_EVENT
         PRM_UNLOCK_DONE_EVENT_DATA unlock_done_data = {
             .status = err,
         };
+        ESP_LOGI(TAG, "[PRM] TX UNLOCK_DONE status=%s", esp_err_to_name(unlock_done_data.status));
         ESP_ERROR_CHECK(esp_event_post_to(pr_events_loop_handle, PRM, PRM_UNLOCK_DONE_EVENT, &unlock_done_data, sizeof(PRM_UNLOCK_DONE_EVENT_DATA), portMAX_DELAY));
         break;
     }
     case PRM_START_EVENT:
     {
         struct PRM_START_EVENT_DATA *start_data = (struct PRM_START_EVENT_DATA *)event_data;
-        ESP_LOGI(TAG, "Starting motor with mode: %d, clockwise: %d", start_data->mode, start_data->clockwise);
-        if (start_data->mode == PRA_RUNE_SMALL_MODE)
+        uint8_t start_mode = 0;
+        if (start_data == NULL)
         {
+            err = ESP_ERR_INVALID_ARG;
+            ESP_LOGE(TAG, "[PRM] RX START event_id=%ld but event_data is NULL", (long)event_id);
+        }
+        else if (start_data->mode == PRA_RUNE_SMALL_MODE)
+        {
+            start_mode = start_data->mode;
+            ESP_LOGI(TAG, "[PRM] RX START event_id=%ld mode=%u direction=%u",
+                     (long)event_id, start_data->mode, start_data->clockwise);
+            int target_rpm = start_data->clockwise ? 1140 : -1140;
+            ESP_LOGI(TAG, "[PRM] START params(small): target_rpm=%d", target_rpm);
             // set speed to 1140 in rpm
-            err = motor_3508->set_speed(CONFIG_DEFAULT_MOTOR_ID, start_data->clockwise ? 1140 : -1140);
+            err = motor_3508->set_speed(CONFIG_DEFAULT_MOTOR_ID, target_rpm);
         }
         else if (start_data->mode == PRA_RUNE_BIG_MODE)
         {
-            ESP_LOGI(TAG, "Amplitude: %f, omega: %f, offset: %f", start_data->amplitude, start_data->omega, start_data->offset);
+            start_mode = start_data->mode;
+            ESP_LOGI(TAG, "[PRM] RX START event_id=%ld mode=%u direction=%u",
+                     (long)event_id, start_data->mode, start_data->clockwise);
+            ESP_LOGI(TAG, "[PRM] START params(big) raw: amp=%f omega=%f offset=%f",
+                     start_data->amplitude, start_data->omega, start_data->offset);
+            float amplitude = start_data->amplitude;
+            float offset = start_data->offset;
+            float omega = start_data->omega;
             // clockwise
             if (start_data->clockwise == PRM_DIRECTION_CLOCKWISE)
             {
-                start_data->amplitude = -start_data->amplitude;
-                start_data->offset = -start_data->offset;
+                amplitude = -amplitude;
+                offset = -offset;
             }
+            ESP_LOGI(TAG, "[PRM] START params(big) applied: amp=%f omega=%f offset=%f",
+                     amplitude, omega, offset);
             // set motor status to MOTOR_TRACE_SIN_PENDING
-            err = motor_3508->set_speed(CONFIG_DEFAULT_MOTOR_ID, start_data->amplitude, start_data->omega, start_data->offset);
+            err = motor_3508->set_speed(CONFIG_DEFAULT_MOTOR_ID, amplitude, omega, offset);
         }
         else
         {
             err = ESP_ERR_INVALID_ARG;
+            start_mode = start_data->mode;
+            ESP_LOGW(TAG, "[PRM] RX START invalid mode=%u direction=%u",
+                     start_data->mode, start_data->clockwise);
         };
+        ESP_LOGI(TAG, "[PRM] set_speed() -> %s", esp_err_to_name(err));
         PRM_START_DONE_EVENT_DATA start_done_data = {
             .status = err,
-            .mode = start_data->mode,
+            .mode = start_mode,
         };
         // post PRM_START_DONE_EVENT
+        ESP_LOGI(TAG, "[PRM] TX START_DONE status=%s mode=%u",
+                 esp_err_to_name(start_done_data.status), start_done_data.mode);
         ESP_ERROR_CHECK(esp_event_post_to(pr_events_loop_handle, PRM, PRM_START_DONE_EVENT, &start_done_data, sizeof(PRM_START_DONE_EVENT_DATA), portMAX_DELAY));
         break;
     }
     case PRM_STOP_EVENT:
-        ESP_LOGI(TAG, "PRM_STOP_EVENT");
-        motor_3508->disable_motor(CONFIG_DEFAULT_MOTOR_ID);
+    {
+        ESP_LOGI(TAG, "[PRM] RX STOP event_id=%ld, begin stopping motor", (long)event_id);
+        err = motor_3508->disable_motor(CONFIG_DEFAULT_MOTOR_ID);
+        ESP_LOGI(TAG, "[PRM] disable_motor() -> %s", esp_err_to_name(err));
+        if (err == ESP_OK)
+        {
+            TickType_t flush_delay = (10 / portTICK_PERIOD_MS) > 0 ? (10 / portTICK_PERIOD_MS) : 1;
+            // Give motor task one control cycle to flush zero current output.
+            ESP_LOGI(TAG, "[PRM] STOP flush delay before vTaskDelay ticks=%lu", (unsigned long)flush_delay);
+            vTaskDelay(flush_delay);
+            ESP_LOGI(TAG, "[PRM] STOP flush delay finished");
+            ESP_LOGI(TAG, "[PRM] Motor stop completed");
+        }
+        else
+        {
+            ESP_LOGE(TAG, "[PRM] Motor stop failed: %s", esp_err_to_name(err));
+        }
+
+        PRM_STOP_DONE_EVENT_DATA stop_done_data = {
+            .status = err,
+        };
+        ESP_LOGI(TAG, "[PRM] TX STOP_DONE status=%s", esp_err_to_name(stop_done_data.status));
+        ESP_ERROR_CHECK(esp_event_post_to(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, &stop_done_data, sizeof(PRM_STOP_DONE_EVENT_DATA), portMAX_DELAY));
         break;
+    }
     default:
         break;
     };
@@ -149,6 +206,7 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_SPEED_STABLE_EVENT, ESPNowProtocol::tx_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_START_DONE_EVENT, ESPNowProtocol::tx_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_UNLOCK_DONE_EVENT, ESPNowProtocol::tx_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, ESPNowProtocol::tx_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register_with(pr_events_loop_handle, PRC, OTA_BEGIN_EVENT, Firmware::global_pr_event_handler, NULL));
 #endif
 #if CONFIG_POWERRUNE_TYPE != 1 // 除了主控外的设备

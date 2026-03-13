@@ -128,6 +128,7 @@ enum
     PRM_START_DONE_EVENT,
     PRM_SPEED_STABLE_EVENT,
     PRM_STOP_EVENT,
+    PRM_STOP_DONE_EVENT,
     PRM_DISCONNECT_EVENT,
     PRM_PING_EVENT,
 };
@@ -187,6 +188,13 @@ struct PRM_STOP_EVENT_DATA
 {
     uint8_t address = 0x05;
     uint8_t data_len = sizeof(PRM_STOP_EVENT_DATA);
+};
+
+struct PRM_STOP_DONE_EVENT_DATA
+{
+    uint8_t address = 0x06;
+    uint8_t data_len = sizeof(PRM_STOP_DONE_EVENT_DATA);
+    esp_err_t status;
 };
 
 struct PRM_DISCONNECT_EVENT_DATA

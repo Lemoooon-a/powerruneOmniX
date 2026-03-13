@@ -121,7 +121,7 @@ public:
     /**
      * @brief 解除电机控制
      */
-    void disable_motor(uint8_t motor_id);
+    esp_err_t disable_motor(uint8_t motor_id);
 
     /**
      * @brief 设置电机速度, 如果电机状态为DISABLED_LOCKED, 则返回ESP_ERR_NOT_SUPPORTED

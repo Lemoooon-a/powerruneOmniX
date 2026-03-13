@@ -16,6 +16,7 @@ SemaphoreHandle_t PowerRune_Armour::LED_Strip_FSM_Semaphore;
 LED_Strip_FSM_t PowerRune_Armour::state;
 
 bool valid[10] = {true, true, true, true, true, true, true, true, true, true};
+static volatile bool pending_blink_after_hit = false;
 
 void PowerRune_Armour::clear_armour(bool refresh)
 {
@@ -156,8 +157,14 @@ void PowerRune_Armour::LED_update_task(void *pvParameter)
                 demux_led = LED_STRIP_MATRIX;
                 led_strip[LED_STRIP_MATRIX]->set_color(state_task.color == PR_RED ? config_info->brightness_proportion_matrix : 0, 0, state_task.color == PR_RED ? 0 : config_info->brightness_proportion_matrix);
                 led_strip[LED_STRIP_MATRIX]->refresh();
-                // 等待信号量
-                xSemaphoreTake(LED_Strip_FSM_Semaphore, portMAX_DELAY);
+                // 命中后的完成事件需要等命中灯效显示后再切换到BLINK
+                if (!pending_blink_after_hit)
+                    xSemaphoreTake(LED_Strip_FSM_Semaphore, portMAX_DELAY);
+                if (pending_blink_after_hit)
+                {
+                    state.LED_Strip_State = LED_STRIP_BLINK;
+                    pending_blink_after_hit = false;
+                }
                 // 转移状态
                 state_task = state;
                 break;
@@ -175,8 +182,14 @@ void PowerRune_Armour::LED_update_task(void *pvParameter)
                 demux_led = LED_STRIP_MATRIX;
                 led_strip[LED_STRIP_MATRIX]->set_color(state_task.color == PR_RED ? config_info->brightness_proportion_matrix : 0, 0, state_task.color == PR_RED ? 0 : config_info->brightness_proportion_matrix);
                 led_strip[LED_STRIP_MATRIX]->refresh();
-                // 等待信号量
-                xSemaphoreTake(LED_Strip_FSM_Semaphore, portMAX_DELAY);
+                // 命中后的完成事件需要等命中灯效显示后再切换到BLINK
+                if (!pending_blink_after_hit)
+                    xSemaphoreTake(LED_Strip_FSM_Semaphore, portMAX_DELAY);
+                if (pending_blink_after_hit)
+                {
+                    state.LED_Strip_State = LED_STRIP_BLINK;
+                    pending_blink_after_hit = false;
+                }
                 // 转移状态
                 state_task = state;
                 break;
@@ -420,6 +433,7 @@ PowerRune_Armour::PowerRune_Armour()
 void PowerRune_Armour::trigger(RUNE_MODE mode, RUNE_COLOR color)
 {
     ESP_LOGI(TAG_ARMOUR, "Trigger Armour with mode: %s, color: %s", mode == PRA_RUNE_BIG_MODE ? "Big" : "Small", color == PR_RED ? "Red" : "Blue");
+    pending_blink_after_hit = false;
     // 状态机更新
     state.LED_Strip_State = LED_STRIP_TARGET;
     state.mode = mode;
@@ -432,6 +446,7 @@ void PowerRune_Armour::trigger(RUNE_MODE mode, RUNE_COLOR color)
 void PowerRune_Armour::stop()
 {
     ESP_LOGI(TAG_ARMOUR, "Stop Armour");
+    pending_blink_after_hit = false;
     // 状态机更新
     state.LED_Strip_State = LED_STRIP_IDLE;
     // 释放信号量
@@ -441,6 +456,7 @@ void PowerRune_Armour::stop()
 void PowerRune_Armour::debug()
 {
     ESP_LOGI(TAG_ARMOUR, "Debug Armour");
+    pending_blink_after_hit = false;
     // 状态机更新
     state.LED_Strip_State = LED_STRIP_DEBUG;
     // 释放信号量
@@ -460,6 +476,7 @@ void PowerRune_Armour::hit(uint8_t score)
 void PowerRune_Armour::blink()
 {
     ESP_LOGI(TAG_ARMOUR, "Activation Complete, Blink Armour");
+    pending_blink_after_hit = false;
     // 状态机更新
     state.LED_Strip_State = LED_STRIP_BLINK;
     // 释放信号量
@@ -492,7 +509,15 @@ void PowerRune_Armour::global_pr_event_handler(void *handler_args, esp_event_bas
         }
         case PRA_COMPLETE_EVENT:
         {
-            blink();
+            if (state.LED_Strip_State == LED_STRIP_HIT)
+            {
+                pending_blink_after_hit = true;
+                xSemaphoreGive(LED_Strip_FSM_Semaphore);
+            }
+            else
+            {
+                blink();
+            }
             break;
         }
         }

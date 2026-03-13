@@ -4,6 +4,10 @@
  */
 #include "main.h"
 
+#ifndef PR_MAIN_MOTOR_ONLY_TEST
+#define PR_MAIN_MOTOR_ONLY_TEST 0
+#endif
+
 // 排序法生成不重复随机数列
 void generate_rand_sequence(uint8_t *rand_sequence, int length)
 {
@@ -43,6 +47,8 @@ static volatile bool g_run_stop_requested = false;
 static volatile bool g_run_restart_requested = false;
 // 运行代号：用于避免旧 stop_task 误杀新 run_task
 static volatile uint32_t g_run_generation = 0;
+
+static void prm_stop_done_event_handler_local(void *handler_args, esp_event_base_t base, int32_t id, void *event_data);
 
 void unlock_done_event_handler(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
 {
@@ -111,6 +117,13 @@ void stop_task(void *pvParameter)
     TaskHandle_t stop_target_task = xTaskGetHandle("run_task");
     QueueHandle_t stop_target_queue = run_queue;
     TimerHandle_t stop_target_timer = hit_timer;
+    QueueHandle_t stop_done_queue = xQueueCreate(1, sizeof(PRM_STOP_DONE_EVENT_DATA));
+    bool stop_done_handler_registered = false;
+    if (stop_done_queue != NULL)
+    {
+        esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, prm_stop_done_event_handler_local, stop_done_queue);
+        stop_done_handler_registered = true;
+    }
 
     g_run_stop_requested = true;
     g_run_restart_requested = false;
@@ -161,16 +174,49 @@ void stop_task(void *pvParameter)
     sprintf(log_string, "Armour stopped, stopping motor");
     esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[STOP_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
     // 发送STOP到PRM
+    bool motor_stop_done_ok = false;
     if (!stop_cancelled_by_new_run)
     {
         PRM_STOP_EVENT_DATA prm_stop_event_data;
+        PRM_STOP_DONE_EVENT_DATA stop_done_data = {};
         prm_stop_event_data.address = MOTOR;
+        if (stop_done_queue != NULL)
+            xQueueReset(stop_done_queue);
+        ESP_LOGI(TAG_MAIN, "Sending PRM_STOP_EVENT: stop_task");
         esp_event_post_to(pr_events_loop_handle, PRM, PRM_STOP_EVENT, &prm_stop_event_data, sizeof(PRM_STOP_EVENT_DATA), portMAX_DELAY);
         // 等待ACK
-        wait_send_ack("PRM_STOP_EVENT");
+        if (wait_send_ack("PRM_STOP_EVENT(stop_task)"))
+        {
+            ESP_LOGI(TAG_MAIN, "PRM_STOP_EVENT ACK received, waiting PRM_STOP_DONE_EVENT: stop_task");
+            if (stop_done_queue != NULL && xQueueReceive(stop_done_queue, &stop_done_data, 3000 / portTICK_PERIOD_MS) == pdTRUE)
+            {
+                ESP_LOGI(TAG_MAIN, "PRM_STOP_DONE_EVENT received: status=%s context=stop_task", esp_err_to_name(stop_done_data.status));
+                motor_stop_done_ok = (stop_done_data.status == ESP_OK);
+            }
+            else
+            {
+                ESP_LOGW(TAG_MAIN, "Timeout waiting PRM_STOP_DONE_EVENT: stop_task");
+            }
+        }
+        else
+        {
+            ESP_LOGW(TAG_MAIN, "PRM_STOP_EVENT ACK timeout: stop_task");
+        }
     }
-    sprintf(log_string, "Motor stopped");
-    esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[STOP_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+    else
+    {
+        ESP_LOGW(TAG_MAIN, "stop_task motor stop skipped because newer run_task detected");
+    }
+
+    if (motor_stop_done_ok)
+    {
+        sprintf(log_string, "Motor stopped");
+        esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[STOP_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+    }
+    else if (!stop_cancelled_by_new_run)
+    {
+        ESP_LOGW(TAG_MAIN, "Motor stop not confirmed by PRM_STOP_DONE_EVENT in stop_task");
+    }
 
     // 等待 run_task 真正退出，避免下一次 RUN 误判为仍在运行
     for (uint8_t tries = 0; tries < 30 && !stop_cancelled_by_new_run; tries++)
@@ -192,23 +238,40 @@ void stop_task(void *pvParameter)
         }
     }
 
+    if (stop_done_handler_registered)
+        esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, prm_stop_done_event_handler_local);
+    if (stop_done_queue != NULL)
+        vQueueDelete(stop_done_queue);
+
     vTaskDelete(NULL);
 }
 
 // PRA_HIT_EVENT 事件处理函数
 void hit_event_handler(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
 {
+    if (handler_args == NULL || event_data == NULL)
+    {
+        return;
+    }
     PRA_HIT_EVENT_DATA *data = (PRA_HIT_EVENT_DATA *)event_data;
-    // 释放信号量
-    xQueueSend((QueueHandle_t)handler_args, data, portMAX_DELAY);
-    return;
+    if (xQueueSend((QueueHandle_t)handler_args, data, 0) != pdTRUE)
+    {
+        ESP_LOGW(TAG_MAIN, "run_queue full, drop hit event addr=%u", data->address);
+    }
 }
 
 void hit_timer_callback(TimerHandle_t xTimer)
 {
+    if (run_queue == NULL)
+    {
+        return;
+    }
     PRA_HIT_EVENT_DATA hit_done_data = {};
     hit_done_data.address = 0xFF;
-    xQueueSend(run_queue, &hit_done_data, portMAX_DELAY);
+    if (xQueueSend(run_queue, &hit_done_data, 0) != pdTRUE)
+    {
+        ESP_LOGW(TAG_MAIN, "run_queue full, drop hit timer marker addr=%u", hit_done_data.address);
+    }
 }
 
 void prm_speed_stable_event_handler(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
@@ -241,6 +304,27 @@ void prm_unlock_done_event_handler(void *handler_args, esp_event_base_t base, in
     xQueueOverwrite(unlock_done_queue, data);
 }
 
+static void queue_overwrite_prm_stop_done(void *handler_args, void *event_data)
+{
+    if (handler_args == NULL || event_data == NULL)
+    {
+        return;
+    }
+    QueueHandle_t stop_done_queue = (QueueHandle_t)handler_args;
+    PRM_STOP_DONE_EVENT_DATA *data = (PRM_STOP_DONE_EVENT_DATA *)event_data;
+    xQueueOverwrite(stop_done_queue, data);
+}
+
+void prm_stop_done_event_handler(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
+{
+    queue_overwrite_prm_stop_done(handler_args, event_data);
+}
+
+static void prm_stop_done_event_handler_local(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
+{
+    queue_overwrite_prm_stop_done(handler_args, event_data);
+}
+
 /**
  * @brief run_task
  * @note 大符运行任务代码
@@ -260,6 +344,7 @@ void run_task(void *pvParameter)
     prm_stop_event_data.address = MOTOR;
     PRM_START_DONE_EVENT_DATA start_done_data = {0};
     PRM_UNLOCK_DONE_EVENT_DATA unlock_done_data = {0};
+    PRM_STOP_DONE_EVENT_DATA stop_done_data = {0};
     // 事件队列
     run_queue = xQueueCreate(5, sizeof(PRA_HIT_EVENT_DATA));
     // FreeRTOS计时器
@@ -268,15 +353,17 @@ void run_task(void *pvParameter)
     bool prm_speed_handler_registered = false;
     bool prm_start_done_handler_registered = false;
     bool prm_unlock_done_handler_registered = false;
+    bool prm_stop_done_handler_registered = false;
     bool pra_hit_handler_registered = false;
     // 电机信号量
     motor_done_sem = xSemaphoreCreateBinary();
     QueueHandle_t motor_start_done_queue = xQueueCreate(1, sizeof(PRM_START_DONE_EVENT_DATA));
     QueueHandle_t motor_unlock_done_queue = xQueueCreate(1, sizeof(PRM_UNLOCK_DONE_EVENT_DATA));
+    QueueHandle_t motor_stop_done_queue = xQueueCreate(1, sizeof(PRM_STOP_DONE_EVENT_DATA));
     const TickType_t small_hit_window = 2500 / portTICK_PERIOD_MS;
     const TickType_t big_first_hit_window = 2500 / portTICK_PERIOD_MS;
     const TickType_t big_second_hit_window = 1000 / portTICK_PERIOD_MS;
-    const TickType_t motor_stable_timeout = 1200 / portTICK_PERIOD_MS;
+    const TickType_t motor_stable_timeout = 5000 / portTICK_PERIOD_MS;
     const TickType_t motor_cmd_settle = (120 / portTICK_PERIOD_MS) > 0 ? (120 / portTICK_PERIOD_MS) : 1;
     const TickType_t wait_poll_ticks = (100 / portTICK_PERIOD_MS) > 0 ? (100 / portTICK_PERIOD_MS) : 1;
     g_run_stop_requested = false;
@@ -336,6 +423,9 @@ void run_task(void *pvParameter)
     esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_UNLOCK_DONE_EVENT, prm_unlock_done_event_handler);
     esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_UNLOCK_DONE_EVENT, prm_unlock_done_event_handler, motor_unlock_done_queue);
     prm_unlock_done_handler_registered = true;
+    esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, prm_stop_done_event_handler);
+    esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, prm_stop_done_event_handler, motor_stop_done_queue);
+    prm_stop_done_handler_registered = true;
 
     auto wait_queue_or_stop = [&](QueueHandle_t q, void *out_data, TickType_t timeout_ticks) -> bool {
         TickType_t start = xTaskGetTickCount();
@@ -366,6 +456,7 @@ void run_task(void *pvParameter)
         }
         return false;
     };
+    bool motor_need_unlock = true;
 
     auto start_motor_for_round = [&]() -> bool {
         if (g_run_stop_requested)
@@ -401,19 +492,25 @@ void run_task(void *pvParameter)
             xQueueReset(motor_unlock_done_queue);
             PRM_UNLOCK_EVENT_DATA prm_unlock_event_data = {};
             prm_unlock_event_data.address = MOTOR;
+            ESP_LOGI(TAG_MAIN, "[PRM] TX UNLOCK");
             esp_event_post_to(pr_events_loop_handle, PRM, PRM_UNLOCK_EVENT, &prm_unlock_event_data, sizeof(PRM_UNLOCK_EVENT_DATA), portMAX_DELAY);
             if (!wait_send_ack("PRM_UNLOCK_EVENT(run_task)"))
+            {
+                ESP_LOGW(TAG_MAIN, "[PRM] ACK UNLOCK timeout");
                 return false;
+            }
+            ESP_LOGI(TAG_MAIN, "[PRM] ACK UNLOCK");
             unlock_done_data = PRM_UNLOCK_DONE_EVENT_DATA{};
             if (!wait_queue_or_stop(motor_unlock_done_queue, &unlock_done_data, 3000 / portTICK_PERIOD_MS))
             {
                 if (!g_run_stop_requested)
-                    ESP_LOGW(TAG_MAIN, "Timeout waiting PRM_UNLOCK_DONE_EVENT");
+                    ESP_LOGW(TAG_MAIN, "[PRM] DONE UNLOCK timeout");
                 return false;
             }
+            ESP_LOGI(TAG_MAIN, "[PRM] DONE UNLOCK status=%s", esp_err_to_name(unlock_done_data.status));
             if (unlock_done_data.status != ESP_OK)
             {
-                ESP_LOGW(TAG_MAIN, "PRM_UNLOCK_DONE_EVENT status: %s", esp_err_to_name(unlock_done_data.status));
+                ESP_LOGW(TAG_MAIN, "[PRM] PRM_UNLOCK_DONE_EVENT status: %s", esp_err_to_name(unlock_done_data.status));
                 return false;
             }
             return true;
@@ -421,32 +518,73 @@ void run_task(void *pvParameter)
 
         auto request_start = [&](esp_err_t *status_out) -> bool {
             xQueueReset(motor_start_done_queue);
+            ESP_LOGI(TAG_MAIN, "[PRM] TX START mode=%u dir=%u", prm_start_event_data.mode, prm_start_event_data.clockwise);
             esp_event_post_to(pr_events_loop_handle, PRM, PRM_START_EVENT, &prm_start_event_data, sizeof(PRM_START_EVENT_DATA), portMAX_DELAY);
             if (!wait_send_ack("PRM_START_EVENT"))
+            {
+                ESP_LOGW(TAG_MAIN, "[PRM] ACK START timeout");
                 return false;
+            }
+            ESP_LOGI(TAG_MAIN, "[PRM] ACK START");
             start_done_data = PRM_START_DONE_EVENT_DATA{};
             if (!wait_queue_or_stop(motor_start_done_queue, &start_done_data, 3000 / portTICK_PERIOD_MS))
             {
                 if (!g_run_stop_requested)
-                    ESP_LOGW(TAG_MAIN, "Timeout waiting PRM_START_DONE_EVENT");
+                    ESP_LOGW(TAG_MAIN, "[PRM] DONE START timeout");
                 return false;
             }
             *status_out = start_done_data.status;
+            ESP_LOGI(TAG_MAIN, "[PRM] DONE START status=%s mode=%u",
+                     esp_err_to_name(start_done_data.status), start_done_data.mode);
             return true;
         };
 
-        auto request_stop = [&](const char *ack_context) {
+        auto request_stop = [&](const char *ack_context) -> bool {
+            if (motor_stop_done_queue == NULL)
+            {
+                ESP_LOGW(TAG_MAIN, "motor_stop_done_queue is NULL: %s", ack_context);
+                return false;
+            }
+            xQueueReset(motor_stop_done_queue);
             PRM_STOP_EVENT_DATA stop_data = {};
             stop_data.address = MOTOR;
+            ESP_LOGI(TAG_MAIN, "[PRM] TX STOP context=%s", ack_context);
             esp_event_post_to(pr_events_loop_handle, PRM, PRM_STOP_EVENT, &stop_data, sizeof(PRM_STOP_EVENT_DATA), portMAX_DELAY);
-            wait_send_ack(ack_context);
+            if (!wait_send_ack(ack_context))
+            {
+                ESP_LOGW(TAG_MAIN, "[PRM] ACK STOP timeout context=%s", ack_context);
+                return false;
+            }
+            ESP_LOGI(TAG_MAIN, "[PRM] ACK STOP context=%s", ack_context);
+            stop_done_data = PRM_STOP_DONE_EVENT_DATA{};
+            if (!wait_queue_or_stop(motor_stop_done_queue, &stop_done_data, 3000 / portTICK_PERIOD_MS))
+            {
+                if (!g_run_stop_requested)
+                    ESP_LOGW(TAG_MAIN, "[PRM] DONE STOP timeout context=%s", ack_context);
+                return false;
+            }
+            ESP_LOGI(TAG_MAIN, "[PRM] DONE STOP status=%s context=%s", esp_err_to_name(stop_done_data.status), ack_context);
+            if (stop_done_data.status != ESP_OK)
+            {
+                ESP_LOGW(TAG_MAIN, "[PRM] DONE STOP status not OK: %s context=%s", esp_err_to_name(stop_done_data.status), ack_context);
+                return false;
+            }
             vTaskDelay(motor_cmd_settle);
+            motor_need_unlock = true;
+            ESP_LOGI(TAG_MAIN, "[PRM] STOP completed, allow UNLOCK/START context=%s", ack_context);
+            return true;
         };
+        (void)request_stop; // Keep helper for logging/diagnosis while recovery chain is disabled.
 
         for (uint8_t attempt = 0; attempt < 2; attempt++)
         {
-            if (!request_unlock())
-                return false;
+            // 循环模式下避免每一轮都UNLOCK导致电机瞬停，仅在首次或恢复后解锁
+            if (motor_need_unlock)
+            {
+                if (!request_unlock())
+                    return false;
+                motor_need_unlock = false;
+            }
 
             esp_err_t start_status = ESP_FAIL;
             if (!request_start(&start_status))
@@ -454,9 +592,8 @@ void run_task(void *pvParameter)
 
             if (start_status == ESP_ERR_NOT_SUPPORTED)
             {
-                ESP_LOGW(TAG_MAIN, "PRM_START_DONE_EVENT status: ESP_ERR_NOT_SUPPORTED, recover #%u by STOP->UNLOCK->START", attempt + 1);
-                request_stop("PRM_STOP_EVENT(recover_not_supported)");
-                continue;
+                ESP_LOGW(TAG_MAIN, "PRM_START_DONE_EVENT status: ESP_ERR_NOT_SUPPORTED, recovery disabled, abort this round");
+                return false;
             }
 
             if (start_status != ESP_OK)
@@ -470,8 +607,8 @@ void run_task(void *pvParameter)
             }
             if (wait_sem_or_stop(motor_done_sem, motor_stable_timeout))
             {
-                ESP_LOGI(TAG_MAIN, "Motor speed stable.");
-                sprintf(log_string, "Motor speed stable.");
+                ESP_LOGI(TAG_MAIN, "[PRM] SPEED STABLE");
+                sprintf(log_string, "PRM speed stable.");
                 esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
                 return true;
             }
@@ -479,38 +616,84 @@ void run_task(void *pvParameter)
             if (g_run_stop_requested)
                 return false;
 
-            ESP_LOGW(TAG_MAIN, "Timeout waiting PRM_SPEED_STABLE_EVENT(%lu ms), recover #%u",
-                     (unsigned long)(motor_stable_timeout * portTICK_PERIOD_MS), attempt + 1);
-
-            if (attempt == 0)
-            {
-                request_stop("PRM_STOP_EVENT(recover_stable_timeout)");
-                continue;
-            }
-
-            // 某些电机固件在恒速模式下可能不上报 SPEED_STABLE，这里容错继续
-            ESP_LOGW(TAG_MAIN, "PRM_SPEED_STABLE_EVENT still missing after recovery, continue running");
-            return true;
+            ESP_LOGW(TAG_MAIN, "PRM_SPEED_STABLE_EVENT timeout(%lu ms), recovery disabled, abort this round",
+                     (unsigned long)(motor_stable_timeout * portTICK_PERIOD_MS));
+            return false;
         }
 
         return false;
     };
 
+#if !PR_MAIN_MOTOR_ONLY_TEST
     // 事件、等待PRA_HIT_EVENT信号量
     esp_event_handler_unregister_with(pr_events_loop_handle, PRA, PRA_HIT_EVENT, hit_event_handler);
     esp_event_handler_register_with(pr_events_loop_handle, PRA, PRA_HIT_EVENT, hit_event_handler, run_queue);
     pra_hit_handler_registered = true;
+#else
+    ESP_LOGW(TAG_MAIN, "[MOTOR_ONLY_TEST] PR_MAIN_MOTOR_ONLY_TEST=1, skip PRA_HIT_EVENT flow");
+#endif
     circulation = run_circulation;
     bool motor_stopped = false;
+    bool motor_running = false;
 
     auto stop_motor_reliably = [&](const char *ack_context, uint8_t retries = 3) -> bool {
+        if (motor_stop_done_queue == NULL)
+        {
+            ESP_LOGW(TAG_MAIN, "motor_stop_done_queue is NULL: %s", ack_context);
+            return false;
+        }
         for (uint8_t i = 0; i < retries; i++)
         {
+            bool ack_received = false;
+            bool done_received = false;
+            esp_err_t done_status = ESP_FAIL;
+            xQueueReset(motor_stop_done_queue);
             prm_stop_event_data.address = MOTOR;
+            ESP_LOGI(TAG_MAIN, "[PRM] TX STOP context=%s retry=%u/%u", ack_context, i + 1, retries);
             esp_event_post_to(pr_events_loop_handle, PRM, PRM_STOP_EVENT, &prm_stop_event_data, sizeof(PRM_STOP_EVENT_DATA), portMAX_DELAY);
-            if (wait_send_ack(ack_context, 1200 / portTICK_PERIOD_MS))
-                return true;
-            vTaskDelay(80 / portTICK_PERIOD_MS);
+            ack_received = wait_send_ack(ack_context, 1200 / portTICK_PERIOD_MS);
+            if (!ack_received)
+            {
+                ESP_LOGW(TAG_MAIN, "[PRM] STOP context=%s retry=%u/%u ack=%s done=%s done_status=N/A",
+                         ack_context, i + 1, retries, ack_received ? "yes" : "no", done_received ? "yes" : "no");
+                vTaskDelay(80 / portTICK_PERIOD_MS);
+                continue;
+            }
+            ESP_LOGI(TAG_MAIN, "[PRM] ACK STOP context=%s retry=%u/%u", ack_context, i + 1, retries);
+            stop_done_data = PRM_STOP_DONE_EVENT_DATA{};
+            done_received = wait_queue_or_stop(motor_stop_done_queue, &stop_done_data, 3000 / portTICK_PERIOD_MS);
+            if (!done_received)
+            {
+                if (!g_run_stop_requested)
+                    ESP_LOGW(TAG_MAIN, "[PRM] STOP context=%s retry=%u/%u ack=%s done=%s done_status=N/A",
+                             ack_context, i + 1, retries, ack_received ? "yes" : "no", done_received ? "yes" : "no");
+                vTaskDelay(80 / portTICK_PERIOD_MS);
+                continue;
+            }
+            done_status = stop_done_data.status;
+            ESP_LOGI(TAG_MAIN, "[PRM] DONE STOP context=%s retry=%u/%u ack=%s done=%s done_status=%s",
+                     ack_context, i + 1, retries,
+                     ack_received ? "yes" : "no",
+                     done_received ? "yes" : "no",
+                     esp_err_to_name(done_status));
+            if (done_status != ESP_OK)
+            {
+                ESP_LOGW(TAG_MAIN, "[PRM] DONE STOP status not OK context=%s retry=%u/%u ack=%s done=%s done_status=%s",
+                         ack_context, i + 1, retries,
+                         ack_received ? "yes" : "no",
+                         done_received ? "yes" : "no",
+                         esp_err_to_name(done_status));
+                vTaskDelay(80 / portTICK_PERIOD_MS);
+                continue;
+            }
+            motor_need_unlock = true;
+            motor_running = false;
+            ESP_LOGI(TAG_MAIN, "[PRM] STOP completed, allow UNLOCK/START context=%s retry=%u/%u ack=%s done=%s done_status=%s",
+                     ack_context, i + 1, retries,
+                     ack_received ? "yes" : "no",
+                     done_received ? "yes" : "no",
+                     esp_err_to_name(done_status));
+            return true;
         }
         return false;
     };
@@ -520,20 +703,43 @@ void run_task(void *pvParameter)
         bool user_stop = false;
         uint8_t score = 0;
         xQueueReset(run_queue);
+#if PR_MAIN_MOTOR_ONLY_TEST
         if (!start_motor_for_round())
         {
-            ESP_LOGW(TAG_MAIN, "start_motor_for_round failed, retry once");
-            PRM_STOP_EVENT_DATA retry_stop_data = {};
-            retry_stop_data.address = MOTOR;
-            esp_event_post_to(pr_events_loop_handle, PRM, PRM_STOP_EVENT, &retry_stop_data, sizeof(PRM_STOP_EVENT_DATA), portMAX_DELAY);
-            wait_send_ack("PRM_STOP_EVENT(retry)");
-            vTaskDelay(150 / portTICK_PERIOD_MS);
+            ESP_LOGW(TAG_MAIN, "[MOTOR_ONLY_TEST] start_motor_for_round failed, abort");
+            circulation = 0;
+            break;
+        }
+        motor_running = true;
+        ESP_LOGI(TAG_MAIN, "motor only test running...");
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        if (stop_motor_reliably("PRM_STOP_EVENT(motor_only_test)"))
+        {
+            motor_stopped = true;
+        }
+        else
+        {
+            ESP_LOGW(TAG_MAIN, "[MOTOR_ONLY_TEST] stop failed: PRM_STOP_EVENT ACK/DONE missing");
+        }
+        circulation = 0;
+        continue;
+#endif
+        bool need_start_this_round = true;
+        if (run_mode_small && circulation && motor_running)
+        {
+            need_start_this_round = false;
+            ESP_LOGI(TAG_MAIN, "Small circulation: keep motor running for next round");
+        }
+
+        if (need_start_this_round)
+        {
             if (!start_motor_for_round())
             {
-                ESP_LOGW(TAG_MAIN, "start_motor_for_round retry failed");
+                ESP_LOGW(TAG_MAIN, "start_motor_for_round failed, recovery disabled, abort this round");
                 circulation = 0;
                 break;
             }
+            motor_running = true;
         }
         PRA_START_EVENT_DATA pra_start_event_data = {
             .address = 0,
@@ -577,7 +783,7 @@ void run_task(void *pvParameter)
                         round_success = false;
                         break;
                     }
-                    ESP_LOGW(TAG_MAIN, "Timeout hit from armour %d", expected_address + 1);
+                    ESP_LOGW(TAG_MAIN, "[HIT] timeout from armour %d", expected_address + 1);
                     round_success = false;
                     break;
                 }
@@ -590,12 +796,12 @@ void run_task(void *pvParameter)
                 }
                 if (hit_done_data.address != expected_address)
                 {
-                    ESP_LOGW(TAG_MAIN, "Mistaken hit from armour %d, expected %d", hit_done_data.address + 1, expected_address + 1);
+                    ESP_LOGW(TAG_MAIN, "[HIT] mistaken armour %d, expected %d", hit_done_data.address + 1, expected_address + 1);
                     round_success = false;
                     break;
                 }
                 score += hit_done_data.score;
-                ESP_LOGI(TAG_MAIN, "Hit from armour %d score +%d", expected_address + 1, hit_done_data.score);
+                ESP_LOGI(TAG_MAIN, "[HIT] armour %d score +%d", expected_address + 1, hit_done_data.score);
             }
 
             if (!round_success)
@@ -666,7 +872,7 @@ void run_task(void *pvParameter)
                         first_hit_ok = true;
                         first_hit_addr = hit_done_data.address;
                         score += hit_done_data.score;
-                        ESP_LOGI(TAG_MAIN, "Big Group %u first hit armour %u score +%u", group + 1, first_hit_addr + 1, hit_done_data.score);
+                        ESP_LOGI(TAG_MAIN, "[HIT] Big Group %u first hit armour %u score +%u", group + 1, first_hit_addr + 1, hit_done_data.score);
                         // 命中后立即熄灭该片
                         stop_armours(&first_hit_addr, 1);
                         break;
@@ -701,7 +907,7 @@ void run_task(void *pvParameter)
                     if (hit_done_data.address == second_target)
                     {
                         score += hit_done_data.score;
-                        ESP_LOGI(TAG_MAIN, "Big Group %u second hit armour %u score +%u", group + 1, second_target + 1, hit_done_data.score);
+                        ESP_LOGI(TAG_MAIN, "[HIT] Big Group %u second hit armour %u score +%u", group + 1, second_target + 1, hit_done_data.score);
                         // 命中后立即熄灭该片
                         stop_armours(&second_target, 1);
                         break;
@@ -767,7 +973,7 @@ void run_task(void *pvParameter)
             }
             else
             {
-                ESP_LOGW(TAG_MAIN, "Single run end: PRM_STOP_EVENT ACK missing after retries");
+                ESP_LOGW(TAG_MAIN, "Single run end: PRM_STOP_EVENT ACK/DONE missing after retries");
             }
         }
     } while (circulation);
@@ -783,7 +989,7 @@ void run_task(void *pvParameter)
     {
         if (!stop_motor_reliably("PRM_STOP_EVENT(final)"))
         {
-            ESP_LOGW(TAG_MAIN, "Final stop: PRM_STOP_EVENT ACK missing after retries");
+            ESP_LOGW(TAG_MAIN, "Final stop: PRM_STOP_EVENT ACK/DONE missing after retries");
         }
     }
     // 注销事件、删除队列、删除计时器
@@ -793,6 +999,8 @@ void run_task(void *pvParameter)
         esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_START_DONE_EVENT, prm_start_done_event_handler);
     if (prm_unlock_done_handler_registered)
         esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_UNLOCK_DONE_EVENT, prm_unlock_done_event_handler);
+    if (prm_stop_done_handler_registered)
+        esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, prm_stop_done_event_handler);
     if (pra_hit_handler_registered)
         esp_event_handler_unregister_with(pr_events_loop_handle, PRA, PRA_HIT_EVENT, hit_event_handler);
     if (run_queue != NULL)
@@ -817,6 +1025,10 @@ void run_task(void *pvParameter)
     if (motor_unlock_done_queue != NULL)
     {
         vQueueDelete(motor_unlock_done_queue);
+    }
+    if (motor_stop_done_queue != NULL)
+    {
+        vQueueDelete(motor_stop_done_queue);
     }
 
     bool restart_next = g_run_restart_requested;
@@ -1618,15 +1830,45 @@ extern "C" void app_main(void)
 
     ESP_LOGI(TAG_MAIN, "BLE Started.");
     const TickType_t init_ack_timeout = 3000 / portTICK_PERIOD_MS;
+    QueueHandle_t init_stop_done_queue = xQueueCreate(1, sizeof(PRM_STOP_DONE_EVENT_DATA));
+    bool init_stop_done_handler_registered = false;
+    if (init_stop_done_queue != NULL)
+    {
+        esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, prm_stop_done_event_handler_local, init_stop_done_queue);
+        init_stop_done_handler_registered = true;
+    }
+
+    auto request_init_motor_stop = [&](const char *context) -> bool {
+        PRM_STOP_EVENT_DATA stop_data = {};
+        PRM_STOP_DONE_EVENT_DATA stop_done_data = {};
+        stop_data.address = MOTOR;
+        if (init_stop_done_queue != NULL)
+            xQueueReset(init_stop_done_queue);
+        ESP_LOGI(TAG_MAIN, "Sending PRM_STOP_EVENT: %s", context);
+        esp_event_post_to(pr_events_loop_handle, PRM, PRM_STOP_EVENT, &stop_data, sizeof(PRM_STOP_EVENT_DATA), portMAX_DELAY);
+        if (!wait_send_ack(context, init_ack_timeout))
+        {
+            ESP_LOGW(TAG_MAIN, "Timeout waiting ACK for %s", context);
+            return false;
+        }
+        ESP_LOGI(TAG_MAIN, "PRM_STOP_EVENT ACK received, waiting PRM_STOP_DONE_EVENT: %s", context);
+        if (init_stop_done_queue == NULL || xQueueReceive(init_stop_done_queue, &stop_done_data, 3000 / portTICK_PERIOD_MS) != pdTRUE)
+        {
+            ESP_LOGW(TAG_MAIN, "Timeout waiting PRM_STOP_DONE_EVENT for %s", context);
+            return false;
+        }
+        ESP_LOGI(TAG_MAIN, "PRM_STOP_DONE_EVENT received: status=%s context=%s", esp_err_to_name(stop_done_data.status), context);
+        if (stop_done_data.status != ESP_OK)
+        {
+            ESP_LOGW(TAG_MAIN, "PRM_STOP_DONE_EVENT status not OK for %s: %s", context, esp_err_to_name(stop_done_data.status));
+            return false;
+        }
+        return true;
+    };
 
     // 发送STOP到各设备以复位
-    PRM_STOP_EVENT_DATA stop_event_data;
-    stop_event_data.address = MOTOR;
-    esp_event_post_to(pr_events_loop_handle, PRM, PRM_STOP_EVENT, &stop_event_data, sizeof(PRM_STOP_EVENT_DATA), portMAX_DELAY);
-    if ((xEventGroupWaitBits(ESPNowProtocol::send_state, ESPNowProtocol::SEND_ACK_OK_BIT, pdTRUE, pdTRUE, init_ack_timeout) & ESPNowProtocol::SEND_ACK_OK_BIT) == 0)
-    {
-        ESP_LOGW(TAG_MAIN, "Timeout waiting ACK for initial PRM_STOP_EVENT");
-    }
+    if (!request_init_motor_stop("PRM_STOP_EVENT(initial)"))
+        ESP_LOGW(TAG_MAIN, "Initial motor stop not confirmed");
 
     // 发送STOP到各装甲板设备
     PRA_STOP_EVENT_DATA pra_stop_event_data;
@@ -1640,13 +1882,13 @@ extern "C" void app_main(void)
         }
     }
     // 电机停止
-    PRM_STOP_EVENT_DATA prm_stop_event_data;
-    prm_stop_event_data.address = MOTOR;
-    esp_event_post_to(pr_events_loop_handle, PRM, PRM_STOP_EVENT, &prm_stop_event_data, sizeof(PRM_STOP_EVENT_DATA), portMAX_DELAY);
-    if ((xEventGroupWaitBits(ESPNowProtocol::send_state, ESPNowProtocol::SEND_ACK_OK_BIT, pdTRUE, pdTRUE, init_ack_timeout) & ESPNowProtocol::SEND_ACK_OK_BIT) == 0)
-    {
-        ESP_LOGW(TAG_MAIN, "Timeout waiting ACK for second PRM_STOP_EVENT");
-    }
+    if (!request_init_motor_stop("PRM_STOP_EVENT(second)"))
+        ESP_LOGW(TAG_MAIN, "Second motor stop not confirmed");
+
+    if (init_stop_done_handler_registered)
+        esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, prm_stop_done_event_handler_local);
+    if (init_stop_done_queue != NULL)
+        vQueueDelete(init_stop_done_queue);
 
     // 启动LED动画，表示大符初始化完成
     xTaskCreate(led_animation_task, "led_animation_task", 2048, NULL, 5, &led_animation_task_handle);

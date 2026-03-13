@@ -10,6 +10,64 @@ const char *TAG_TWAI = "Motor";
 motor_info_t *Motor::motor_info = NULL;
 size_t Motor::motor_counts = 0;
 
+static void recover_twai_if_invalid_state(const char *context, esp_err_t err)
+{
+    if (err != ESP_ERR_INVALID_STATE)
+    {
+        return;
+    }
+
+    static TickType_t last_log_tick = 0;
+    static TickType_t last_recover_tick = 0;
+    TickType_t now = xTaskGetTickCount();
+
+    if (now - last_log_tick > (1000 / portTICK_PERIOD_MS))
+    {
+        twai_status_info_t st = {};
+        if (twai_get_status_info(&st) == ESP_OK)
+        {
+            ESP_LOGE(TAG_TWAI, "%s invalid state, twai_state=%d tx_err=%u rx_err=%u tx_failed=%u",
+                     context, (int)st.state, (unsigned)st.tx_error_counter, (unsigned)st.rx_error_counter, (unsigned)st.tx_failed_count);
+        }
+        else
+        {
+            ESP_LOGE(TAG_TWAI, "%s failed: %s", context, esp_err_to_name(err));
+        }
+        last_log_tick = now;
+    }
+
+    if (now - last_recover_tick < (200 / portTICK_PERIOD_MS))
+    {
+        return;
+    }
+    last_recover_tick = now;
+
+    esp_err_t stop_err = twai_stop();
+    if (stop_err != ESP_OK && stop_err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGW(TAG_TWAI, "twai_stop during recovery failed: %s", esp_err_to_name(stop_err));
+    }
+
+    // Some states need an explicit recovery trigger before restart.
+    esp_err_t rec_err = twai_initiate_recovery();
+    if (rec_err != ESP_OK && rec_err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGW(TAG_TWAI, "twai_initiate_recovery failed: %s", esp_err_to_name(rec_err));
+    }
+
+    vTaskDelay((10 / portTICK_PERIOD_MS) > 0 ? (10 / portTICK_PERIOD_MS) : 1);
+
+    esp_err_t start_err = twai_start();
+    if (start_err != ESP_OK)
+    {
+        ESP_LOGW(TAG_TWAI, "twai_start during recovery failed: %s", esp_err_to_name(start_err));
+    }
+    else
+    {
+        ESP_LOGW(TAG_TWAI, "TWAI restarted after invalid state");
+    }
+}
+
 esp_err_t Motor::set_current(uint8_t motor_id, int16_t current, current_info_t &current_info)
 {
     for (size_t i = 0; i < motor_counts; i++)
@@ -58,11 +116,18 @@ void Motor::send_motor_current(current_info_t &current_info)
     tx_msg.data[5] = current_info.iq3;
     tx_msg.data[6] = current_info.iq4 >> 8;
     tx_msg.data[7] = current_info.iq4;
-
-    esp_err_t err = twai_transmit(&tx_msg, portMAX_DELAY);
+    TickType_t tx_timeout = (5 / portTICK_PERIOD_MS) > 0 ? (5 / portTICK_PERIOD_MS) : 1;
+    esp_err_t err = twai_transmit(&tx_msg, tx_timeout);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG_TWAI, "twai_transmit failed: %s", esp_err_to_name(err));
+        if (err == ESP_ERR_INVALID_STATE)
+        {
+            recover_twai_if_invalid_state("twai_transmit", err);
+        }
+        else if (err != ESP_ERR_TIMEOUT)
+        {
+            ESP_LOGE(TAG_TWAI, "twai_transmit failed: %s", esp_err_to_name(err));
+        }
     }
 };
 
@@ -136,6 +201,7 @@ Motor::Motor(uint8_t *motor_id, uint8_t motor_counts, gpio_num_t TX_TWAI_GPIO, g
     }
 
     ESP_LOGI("TWAI", "TWAI initialized.");
+    ESP_LOGW(TAG_TWAI, "TWAI recovery patch active: R2");
 
     // init motor_info
     for (size_t i = 0; i < motor_counts; i++)
@@ -193,8 +259,6 @@ esp_err_t Motor::unlock_motor(uint8_t motor_id)
             // 解除锁定后重置接收时间，避免刚恢复就被旧超时判定为断连
             motor_info[i].last_received = xTaskGetTickCount();
             ESP_LOGI(TAG_TWAI, "Motor %d unlocked.", motor_id);
-            // resume task
-            vTaskResume(xTaskGetHandle("task_motor"));
             ret = ESP_OK;
             break;
         }
@@ -205,7 +269,7 @@ esp_err_t Motor::unlock_motor(uint8_t motor_id)
 /**
  * @brief 解除电机控制
  */
-void Motor::disable_motor(uint8_t motor_id)
+esp_err_t Motor::disable_motor(uint8_t motor_id)
 {
     for (size_t i = 0; i < motor_counts; i++)
     {
@@ -219,10 +283,13 @@ void Motor::disable_motor(uint8_t motor_id)
             // PID reset
             reset();
             motor_info[i].motor_status = motor_info[i].motor_status == MOTOR_DISABLED_LOCKED ? MOTOR_DISABLED_LOCKED : MOTOR_DISABLED;
-            ESP_LOGI(TAG_TWAI, "Motor %d disabled.", i);
-            break;
+            motor_info[i].last_received = xTaskGetTickCount();
+            ESP_LOGI(TAG_TWAI, "Motor %d disabled.", motor_id);
+            return ESP_OK;
         }
     }
+    ESP_LOGW(TAG_TWAI, "disable_motor: invalid ID %u", motor_id);
+    return ESP_ERR_INVALID_ARG;
 };
 
 /**
@@ -235,9 +302,9 @@ esp_err_t Motor::set_speed(uint8_t motor_id, int16_t speed)
         // locked
         if (motor_info[i].motor_id == motor_id)
         {
-            if (motor_info[i].motor_status == MOTOR_DISABLED_LOCKED)
+            if (motor_info[i].motor_status == MOTOR_DISABLED_LOCKED || motor_info[i].motor_status == MOTOR_DISCONNECTED)
             {
-                ESP_LOGE(TAG_TWAI, "Motor %d is locked.", motor_id);
+                ESP_LOGE(TAG_TWAI, "Motor %d is not ready (status=%d).", motor_id, motor_info[i].motor_status);
                 return ESP_ERR_NOT_SUPPORTED;
             }
             motor_info[i].motor_status = MOTOR_NORMAL_PENDING;
@@ -262,9 +329,9 @@ esp_err_t Motor::set_speed(uint8_t motor_id, float amplitude, float omega, float
     {
         if (motor_info[i].motor_id == motor_id)
         {
-            if (motor_info[i].motor_status == MOTOR_DISABLED_LOCKED)
+            if (motor_info[i].motor_status == MOTOR_DISABLED_LOCKED || motor_info[i].motor_status == MOTOR_DISCONNECTED)
             {
-                ESP_LOGE(TAG_TWAI, "Motor %d is locked.", motor_id);
+                ESP_LOGE(TAG_TWAI, "Motor %d is not ready (status=%d).", motor_id, motor_info[i].motor_status);
                 return ESP_ERR_NOT_SUPPORTED;
             }
             motor_info[i].speed_trace_sin_info.amplitude = amplitude;
@@ -300,59 +367,85 @@ void Motor::state_check()
     current_tick = xTaskGetTickCount();
 
     twai_message_t twai_msg_re;
-
-    // receive队列是否为空
-    if (twai_receive(&twai_msg_re, 100) == ESP_OK)
+    esp_err_t rx_err = twai_receive(&twai_msg_re, 100);
+    if (rx_err == ESP_OK)
     {
-        // 获取电机ID
         uint8_t motor_id = twai_msg_re.identifier - 0x200;
+        bool matched = false;
 
         for (size_t i = 0; i < motor_counts; i++)
         {
-            // update reveive time
-            motor_info[i].last_received = current_tick;
             if (motor_info[i].motor_id == motor_id)
             {
+                // Update RX time only for matched motor.
+                motor_info[i].last_received = current_tick;
                 motor_info[i].speed = (int16_t)(twai_msg_re.data[2] << 8 | twai_msg_re.data[3]);
                 motor_info[i].current = (int16_t)(twai_msg_re.data[4] << 8 | twai_msg_re.data[5]);
                 motor_info[i].temp = twai_msg_re.data[6];
+                matched = true;
 
-                // 将DISCONNECTED状态更新为DISABLED_LOCKED状态
-                if ((motor_info[i].motor_status == MOTOR_DISCONNECTED) & (current_tick - motor_info[i].last_received < 100))
+                if (motor_info[i].motor_status == MOTOR_DISCONNECTED)
                 {
-                    motor_info[i].motor_status = MOTOR_DISABLED_LOCKED;
+                    motor_info[i].motor_status = MOTOR_DISABLED;
+                    ESP_LOGW(TAG_TWAI, "Motor %d feedback restored.", motor_id);
                 }
-                // 按照一定的时间间隔打印电机状态，注意不可以用绝对值取模，应该用上一秒发送
+
                 static uint32_t last_print = 0;
                 if (motor_info[i].motor_status != MOTOR_DISABLED_LOCKED && current_tick - last_print > 1000)
                 {
                     ESP_LOGI(TAG_TWAI, "Motor %d State: Speed %d, Current %d, Temp %d .", motor_id, motor_info[i].speed, motor_info[i].current, motor_info[i].temp);
                     last_print = current_tick;
                 }
+                break;
             }
         }
-    }
-    else
-    {
-        // 接收队列为空则将电机状态更新为DISCONNECTED
-        for (size_t i = 0; i < motor_counts; i++)
+        if (!matched)
         {
-            // check motor status
-            if (current_tick - motor_info[i].last_received > 1000)
-            {
-                motor_info[i].motor_status = MOTOR_DISABLED_LOCKED;
-                PRM_DISCONNECT_EVENT_DATA disconnect_data;
-                esp_event_post_to(pr_events_loop_handle, PRM, PRM_DISCONNECT_EVENT, &disconnect_data, sizeof(PRM_DISCONNECT_EVENT_DATA), portMAX_DELAY);
-                ESP_LOGE(TAG_TWAI, "Motor %d disconnected.", motor_info[i].motor_id);
-                // 暂停任务
-                vTaskSuspend(NULL);
-            }
+            ESP_LOGW(TAG_TWAI, "Unknown motor feedback id: %u", motor_id);
+        }
+    }
+    else if (rx_err != ESP_ERR_TIMEOUT)
+    {
+        if (rx_err == ESP_ERR_INVALID_STATE)
+        {
+            recover_twai_if_invalid_state("twai_receive", rx_err);
+        }
+        else
+        {
+            ESP_LOGE(TAG_TWAI, "twai_receive failed: %s", esp_err_to_name(rx_err));
+        }
+    }
+
+    // Keep task alive even if CAN RX times out.
+    for (size_t i = 0; i < motor_counts; i++)
+    {
+        bool running_state = (motor_info[i].motor_status == MOTOR_NORMAL_PENDING ||
+                              motor_info[i].motor_status == MOTOR_NORMAL ||
+                              motor_info[i].motor_status == MOTOR_TRACE_SIN_PENDING ||
+                              motor_info[i].motor_status == MOTOR_TRACE_SIN_STABLE);
+        if (!running_state)
+        {
+            continue;
+        }
+
+        if (current_tick - motor_info[i].last_received <= 1000)
+        {
+            continue;
+        }
+
+        if (motor_info[i].motor_status != MOTOR_DISCONNECTED)
+        {
+            motor_info[i].motor_status = MOTOR_DISCONNECTED;
+            motor_info[i].set_speed = 0;
+            PRM_DISCONNECT_EVENT_DATA disconnect_data = {};
+            esp_event_post_to(pr_events_loop_handle, PRM, PRM_DISCONNECT_EVENT, &disconnect_data, sizeof(PRM_DISCONNECT_EVENT_DATA), portMAX_DELAY);
+            ESP_LOGE(TAG_TWAI, "Motor %d disconnected.", motor_info[i].motor_id);
         }
     }
 }
 
 /**
- * @brief FreeRTOS Task: 控制电机运动，同时接受电机状态
+ *  FreeRTOS Task: 控制电机运动，同时接受电机状态
  */
 void Motor::task_motor(void *args)
 {
