@@ -1,7 +1,0 @@
-/.vscode/
-/.devcontainer/
-/build/
-*.log
-*.old
-*.lock
-*.log

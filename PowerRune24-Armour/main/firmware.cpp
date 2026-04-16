@@ -252,8 +252,11 @@ esp_err_t Firmware::wifi_ota_init()
 // Firmware Functions
 esp_err_t Firmware::wifi_connect(const PowerRune_Common_config_info_t *config_common_info, uint8_t retryNum)
 {
-    // Retry counter
-    uint8_t retry = 0;
+    if (config_common_info == NULL || strlen(config_common_info->SSID) == 0)
+    {
+        ESP_LOGE(TAG_FIRMWARE, "wifi_connect config invalid");
+        return ESP_ERR_INVALID_ARG;
+    }
     // Connect Wifi
     wifi_config_t wifi_config = {
         .sta = {
@@ -274,39 +277,73 @@ esp_err_t Firmware::wifi_connect(const PowerRune_Common_config_info_t *config_co
 
     // Set Semaphore
     EventGroupHandle_t wifi_event_group = xEventGroupCreate();
-    // 注册连接事件监听
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, (esp_event_handler_t)Firmware::global_system_event_handler, &wifi_event_group);
-    esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, (esp_event_handler_t)Firmware::global_system_event_handler, &wifi_event_group);
-
-    // Establish connection
-    EventBits_t bits;
-    do
+    if (wifi_event_group == NULL)
     {
-        // Connect to AP
+        ESP_LOGE(TAG_FIRMWARE, "create wifi_event_group failed");
+        return ESP_ERR_NO_MEM;
+    }
+    // 注册连接事件监听
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, (esp_event_handler_t)Firmware::global_system_event_handler, &wifi_event_group));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, (esp_event_handler_t)Firmware::global_system_event_handler, &wifi_event_group));
+
+    // Establish connection with timeout-retry, if already connected then return directly
+    constexpr TickType_t connect_wait_ticks = 10000 / portTICK_PERIOD_MS;
+    esp_err_t connect_result = ESP_ERR_TIMEOUT;
+    for (uint8_t attempt = 0; attempt <= retryNum; attempt++)
+    {
+        wifi_ap_record_t ap_info = {};
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
+        {
+            ESP_LOGI(TAG_FIRMWARE, "Already connected to AP: %s", (const char *)ap_info.ssid);
+            connect_result = ESP_OK;
+            break;
+        }
+
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
         esp_err_t err = esp_wifi_connect();
         if (err != ESP_OK && err != ESP_ERR_WIFI_CONN)
-            ESP_ERROR_CHECK(err);
-        // Wait for connection
-        ESP_LOGI(TAG_FIRMWARE, "Waiting for connection...%i", retry);
-        bits = xEventGroupWaitBits(wifi_event_group, Firmware::WIFI_CONNECTED_BIT | Firmware::WIFI_FAIL_BIT, true, false, 20000 / portTICK_PERIOD_MS);
-        if (retry++ == retryNum && bits != Firmware::WIFI_CONNECTED_BIT)
         {
-            ESP_LOGE(TAG_FIRMWARE, "Connect to AP failed");
-            return ESP_ERR_TIMEOUT;
+            ESP_LOGE(TAG_FIRMWARE, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+            connect_result = err;
+            break;
         }
-    } while (bits != Firmware::WIFI_CONNECTED_BIT);
-    // 释放事件组
-    vEventGroupDelete(wifi_event_group);
-    // 注销事件监听
+        // Wait for connection
+        ESP_LOGI(TAG_FIRMWARE, "Waiting for connection...%u/%u", attempt + 1, retryNum + 1);
+        EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
+                                               Firmware::WIFI_CONNECTED_BIT | Firmware::WIFI_FAIL_BIT,
+                                               pdTRUE, pdFALSE, connect_wait_ticks);
+        if (bits & Firmware::WIFI_CONNECTED_BIT)
+        {
+            connect_result = ESP_OK;
+            break;
+        }
+
+        if (attempt < retryNum)
+        {
+            ESP_LOGW(TAG_FIRMWARE, "Connect attempt %u/%u failed, retrying...",
+                     attempt + 1, retryNum + 1);
+        }
+    }
+    if (connect_result != ESP_OK)
+    {
+        ESP_LOGE(TAG_FIRMWARE, "Connect to AP failed after %u attempts", retryNum + 1);
+    }
+
+    // 注销事件监听并释放事件组（无论成功失败都清理，避免下次连接流程残留）
     esp_event_handler_unregister(IP_EVENT, ESP_EVENT_ANY_ID, Firmware::global_system_event_handler);
     esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, Firmware::global_system_event_handler);
-    return ESP_OK;
+    vEventGroupDelete(wifi_event_group);
+    return connect_result;
 }
 
 void Firmware::wifi_disconnect()
 {
-    // 断开连接
-    ESP_ERROR_CHECK(esp_wifi_disconnect());
+    // 断开连接（未连接时忽略，避免OTA失败路径触发abort）
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_CONNECT)
+    {
+        ESP_LOGW(TAG_FIRMWARE, "esp_wifi_disconnect returned: %s", esp_err_to_name(err));
+    }
 }
 
 void Firmware::http_cleanup(esp_http_client_handle_t client)

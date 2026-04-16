@@ -47,8 +47,73 @@ static volatile bool g_run_stop_requested = false;
 static volatile bool g_run_restart_requested = false;
 // 运行代号：用于避免旧 stop_task 误杀新 run_task
 static volatile uint32_t g_run_generation = 0;
+enum LOGO_ANIMATION_MODE : uint8_t
+{
+    LOGO_ANIM_IDLE_FLOW_GRADIENT = 0,
+    LOGO_ANIM_MONO_BREATH = 1,
+    LOGO_ANIM_SOLID = 2,
+    LOGO_ANIM_OFF = 3,
+};
+static volatile uint8_t g_logo_animation_mode = LOGO_ANIM_IDLE_FLOW_GRADIENT;
+static volatile uint8_t g_logo_animation_color = PR_RED;
 
 static void prm_stop_done_event_handler_local(void *handler_args, esp_event_base_t base, int32_t id, void *event_data);
+
+static inline uint8_t sanitize_logo_color(uint8_t color)
+{
+    return (color == PR_BLUE) ? PR_BLUE : PR_RED;
+}
+
+static inline void notify_logo_animation_task()
+{
+    if (led_animation_task_handle != NULL)
+        xTaskNotifyGive(led_animation_task_handle);
+}
+
+static void set_logo_idle_flow_mode()
+{
+    g_logo_animation_mode = LOGO_ANIM_IDLE_FLOW_GRADIENT;
+    notify_logo_animation_task();
+}
+
+static void set_logo_mono_breath_mode(uint8_t color)
+{
+    g_logo_animation_mode = LOGO_ANIM_MONO_BREATH;
+    g_logo_animation_color = sanitize_logo_color(color);
+    notify_logo_animation_task();
+}
+
+static void set_logo_solid_mode(uint8_t color)
+{
+    g_logo_animation_mode = LOGO_ANIM_SOLID;
+    g_logo_animation_color = sanitize_logo_color(color);
+    notify_logo_animation_task();
+}
+
+static void set_logo_off_mode()
+{
+    g_logo_animation_mode = LOGO_ANIM_OFF;
+    notify_logo_animation_task();
+}
+
+static void clear_gpa_score_history()
+{
+    score_vector.clear();
+    memset(ops_gpa_val, 0, sizeof(ops_gpa_val));
+    esp_ble_gatts_set_attr_value(ops_handle_table[GPA_VAL], sizeof(ops_gpa_val), ops_gpa_val);
+}
+
+static void update_gpa_score_history(uint8_t score)
+{
+    score_vector.push_back(score);
+    size_t len = score_vector.size();
+    memset(ops_gpa_val, 0, sizeof(ops_gpa_val));
+    for (size_t i = 0; i < sizeof(ops_gpa_val) && i < len; i++)
+    {
+        ops_gpa_val[i] = score_vector[len - 1 - i];
+    }
+    esp_ble_gatts_set_attr_value(ops_handle_table[GPA_VAL], sizeof(ops_gpa_val), ops_gpa_val);
+}
 
 void unlock_done_event_handler(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
 {
@@ -98,17 +163,7 @@ void unlock_task(void *pvParameter)
 // PowerRune_Events handles
 static void pra_stop(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
 {
-    if (led_animation_task_handle == NULL)
-        return;
-
-    while (eTaskGetState(led_animation_task_handle) == eSuspended)
-    {
-        vTaskResume(led_animation_task_handle);
-        // 发送重置通知
-        xTaskNotifyGive(led_animation_task_handle);
-        vTaskDelay(100);
-    }
-    return;
+    set_logo_idle_flow_mode();
 }
 
 void stop_task(void *pvParameter)
@@ -336,7 +391,7 @@ void run_task(void *pvParameter)
     u_int16_t len;
     // 随机数列
     uint8_t rune_start_sequence[5];
-    char log_string[100];
+    char log_string[192];
     PRA_HIT_EVENT_DATA hit_done_data = {0};
     bool circulation = false;
     uint8_t last_first_activation_armour = 0;
@@ -377,35 +432,162 @@ void run_task(void *pvParameter)
             wait_send_ack("PRA_STOP_EVENT");
         }
     };
+    auto notify_test_hit_score = [&](const char *mode_tag, uint8_t address, uint8_t hit_score) {
+        update_gpa_score_history(hit_score);
+        ESP_LOGI(TAG_MAIN, "[%s] target armour %u hit score +%u", mode_tag, address + 1, hit_score);
+        snprintf(log_string, sizeof(log_string), "[%s] Armour %u hit score +%u", mode_tag, address + 1, hit_score);
+        esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+    };
     // 注册事件
     esp_ble_gatts_get_attr_value(ops_handle_table[RUN_VAL], &len, &value);
 
-    const bool run_color_blue = (value[0] == PR_BLUE);
-    const bool run_mode_small = (value[1] == PRA_RUNE_SMALL_MODE);
-    const bool run_circulation = (value[2] == 1);
-    const bool run_clockwise = (value[3] == PRM_DIRECTION_CLOCKWISE);
+    uint8_t run_color = PR_RED;
+    uint8_t run_mode = PRA_RUNE_BIG_MODE;
+    bool run_circulation = false;
+    uint8_t run_direction = PRM_DIRECTION_CLOCKWISE;
+    uint8_t run_test_leaf = 1;
+    uint8_t run_big_ready_a = 1;
+    uint8_t run_big_ready_b = 2;
+    uint8_t run_small_progress = 0;
+    if (value != NULL)
+    {
+        if (len >= 1)
+            run_color = value[0];
+        if (len >= 2)
+            run_mode = value[1];
+        if (len >= 3)
+            run_circulation = (value[2] == 1);
+        if (len >= 4)
+            run_direction = value[3];
+        if (len >= 5)
+            run_test_leaf = value[4];
+        if (len >= 6)
+            run_big_ready_a = value[5];
+        if (len >= 7)
+            run_big_ready_b = value[6];
+        if (len >= 8)
+            run_small_progress = value[7];
+    }
+    if (run_color != PR_RED && run_color != PR_BLUE)
+    {
+        ESP_LOGW(TAG_MAIN, "Invalid run color %u, fallback to red", run_color);
+        run_color = PR_RED;
+    }
+    if (run_mode != PRA_RUNE_BIG_MODE &&
+        run_mode != PRA_RUNE_SMALL_MODE &&
+        run_mode != PRA_RUNE_SINGLE_TEST_MODE &&
+        run_mode != PRA_RUNE_ALL_TARGET_READY_MODE &&
+        run_mode != PRA_RUNE_ALL_SUCCESS_STATIC_MODE &&
+        run_mode != PRA_RUNE_SMALL_4_HIT_1_READY_TEST_MODE &&
+        run_mode != PRA_RUNE_BIG_PROGRESS_2_READY_TEST_MODE &&
+        run_mode != PRA_RUNE_SINGLE_SCORE_TEST_MODE &&
+        run_mode != PRA_RUNE_AUTO_SUCCESS_MODE)
+    {
+        ESP_LOGW(TAG_MAIN, "Invalid run mode %u, fallback to big mode", run_mode);
+        run_mode = PRA_RUNE_BIG_MODE;
+    }
+    if (run_direction != PRM_DIRECTION_CLOCKWISE &&
+        run_direction != PRM_DIRECTION_ANTICLOCKWISE)
+    {
+        ESP_LOGW(TAG_MAIN, "Invalid run direction %u, fallback to clockwise", run_direction);
+        run_direction = PRM_DIRECTION_CLOCKWISE;
+    }
+    if (run_test_leaf < 1 || run_test_leaf > 5)
+    {
+        ESP_LOGW(TAG_MAIN, "Invalid test leaf %u, fallback to 1", run_test_leaf);
+        run_test_leaf = 1;
+    }
+    if (run_big_ready_a < 1 || run_big_ready_a > 5)
+    {
+        ESP_LOGW(TAG_MAIN, "Invalid big ready leaf A %u, fallback to 1", run_big_ready_a);
+        run_big_ready_a = 1;
+    }
+    if (run_big_ready_b < 1 || run_big_ready_b > 5)
+    {
+        ESP_LOGW(TAG_MAIN, "Invalid big ready leaf B %u, fallback to 2", run_big_ready_b);
+        run_big_ready_b = 2;
+    }
+    if (run_big_ready_a == run_big_ready_b)
+    {
+        run_big_ready_b = (run_big_ready_a % 5) + 1;
+        ESP_LOGW(TAG_MAIN, "Big debug ready leaves duplicated, auto adjust to A=%u B=%u", run_big_ready_a, run_big_ready_b);
+    }
+    if (run_small_progress > 4)
+    {
+        ESP_LOGW(TAG_MAIN, "Invalid small debug progress %u, fallback to 0", run_small_progress);
+        run_small_progress = 0;
+    }
+
+    const bool run_color_blue = (run_color == PR_BLUE);
+    const bool run_mode_big = (run_mode == PRA_RUNE_BIG_MODE);
+    const bool run_mode_small = (run_mode == PRA_RUNE_SMALL_MODE);
+    const bool run_mode_single_test = (run_mode == PRA_RUNE_SINGLE_TEST_MODE);
+    const bool run_mode_single_score_test = (run_mode == PRA_RUNE_SINGLE_SCORE_TEST_MODE);
+    const bool run_mode_auto_success = (run_mode == PRA_RUNE_AUTO_SUCCESS_MODE);
+    const bool run_mode_all_target_ready = (run_mode == PRA_RUNE_ALL_TARGET_READY_MODE);
+    const bool run_mode_all_success_static = (run_mode == PRA_RUNE_ALL_SUCCESS_STATIC_MODE);
+    const bool run_mode_small_4_hit_1_ready_test = (run_mode == PRA_RUNE_SMALL_4_HIT_1_READY_TEST_MODE);
+    const bool run_mode_big_progress_2_ready_test = (run_mode == PRA_RUNE_BIG_PROGRESS_2_READY_TEST_MODE);
+    const bool run_mode_small_profile = run_mode_small || run_mode_small_4_hit_1_ready_test;
+    const bool run_mode_big_profile = run_mode_big || run_mode_big_progress_2_ready_test || run_mode_auto_success;
+    const bool run_mode_no_motor = run_mode_single_test || run_mode_single_score_test || run_mode_all_target_ready || run_mode_all_success_static;
+    const bool run_clockwise = (run_direction == PRM_DIRECTION_CLOCKWISE);
+    const char *run_mode_text = "Big";
+    switch (run_mode)
+    {
+    case PRA_RUNE_SMALL_MODE:
+        run_mode_text = "Small";
+        break;
+    case PRA_RUNE_SINGLE_TEST_MODE:
+        run_mode_text = "SingleTest";
+        break;
+    case PRA_RUNE_SINGLE_SCORE_TEST_MODE:
+        run_mode_text = "SingleScoreTest";
+        break;
+    case PRA_RUNE_AUTO_SUCCESS_MODE:
+        run_mode_text = "AutoSuccess";
+        break;
+    case PRA_RUNE_ALL_TARGET_READY_MODE:
+        run_mode_text = "AllTargetReady";
+        break;
+    case PRA_RUNE_ALL_SUCCESS_STATIC_MODE:
+        run_mode_text = "AllSuccessStatic";
+        break;
+    case PRA_RUNE_SMALL_4_HIT_1_READY_TEST_MODE:
+        run_mode_text = "Small4Hit1ReadyTest";
+        break;
+    case PRA_RUNE_BIG_PROGRESS_2_READY_TEST_MODE:
+        run_mode_text = "BigProgress2ReadyTest";
+        break;
+    default:
+        break;
+    }
 
     ESP_LOGI(TAG_MAIN, "Run Triggered:");
     ESP_LOGI(TAG_MAIN, "Color : %s", run_color_blue ? "Blue" : "Red");
-    ESP_LOGI(TAG_MAIN, "Mode : %s", run_mode_small ? "Small" : "Big");
+    ESP_LOGI(TAG_MAIN, "Mode : %s", run_mode_text);
     ESP_LOGI(TAG_MAIN, "Circulation : %s", run_circulation ? "Enabled" : "Disabled");
     ESP_LOGI(TAG_MAIN, "Direction : %s", run_clockwise ? "Clockwise" : "Anti-Clockwise");
+    ESP_LOGI(TAG_MAIN, "Test Leaf : %u", run_test_leaf);
+    ESP_LOGI(TAG_MAIN, "Big Ready Leafs : %u,%u", run_big_ready_a, run_big_ready_b);
+    ESP_LOGI(TAG_MAIN, "Small Progress : %u/4", run_small_progress);
     // 发送indicator日志
-    sprintf(log_string, "PowerRune Start with Color %s, Mode %s, Circulation %s, Direction %s.",
-            run_color_blue ? "Blue" : "Red",
-            run_mode_small ? "Small" : "Big",
-            run_circulation ? "Enabled" : "Disabled",
-            run_clockwise ? "Clockwise" : "Anti-Clockwise");
+    snprintf(log_string, sizeof(log_string), "Run Color %s Mode %s Loop %s Dir %s Leaf %u BigReady %u,%u SmallProg %u/4",
+             run_color_blue ? "Blue" : "Red",
+             run_mode_text,
+             run_circulation ? "Enabled" : "Disabled",
+             run_clockwise ? "Clockwise" : "Anti-Clockwise",
+             run_test_leaf,
+             run_big_ready_a,
+             run_big_ready_b,
+             run_small_progress);
     esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
 
-    // 设置颜色
-    vTaskSuspend(led_animation_task_handle);
-    if (!run_color_blue)
-        led_strip->set_color(config->get_config_info_pt()->brightness, 0, 0);
+    // 中心标：全靶待击打模式使用同色呼吸，其余模式固定同色常亮
+    if (run_mode_all_target_ready)
+        set_logo_mono_breath_mode(run_color);
     else
-        led_strip->set_color(0, 0, config->get_config_info_pt()->brightness);
-
-    led_strip->refresh();
+        set_logo_solid_mode(run_color);
 
     /* 生成随机速度参数
    速度目标函数为： spd = a ∗ sin(𝜔𝜔 ∗ 𝑡𝑡) + 𝑏𝑏，其中 spd 的单位
@@ -414,18 +596,21 @@ void run_task(void *pvParameter)
    其中 t 重置为 0， a 和ω重置为取值范围内任意值。*/
 
     // 注册事件
-    esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_SPEED_STABLE_EVENT, prm_speed_stable_event_handler);
-    esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_SPEED_STABLE_EVENT, prm_speed_stable_event_handler, motor_done_sem);
-    prm_speed_handler_registered = true;
-    esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_START_DONE_EVENT, prm_start_done_event_handler);
-    esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_START_DONE_EVENT, prm_start_done_event_handler, motor_start_done_queue);
-    prm_start_done_handler_registered = true;
-    esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_UNLOCK_DONE_EVENT, prm_unlock_done_event_handler);
-    esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_UNLOCK_DONE_EVENT, prm_unlock_done_event_handler, motor_unlock_done_queue);
-    prm_unlock_done_handler_registered = true;
-    esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, prm_stop_done_event_handler);
-    esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, prm_stop_done_event_handler, motor_stop_done_queue);
-    prm_stop_done_handler_registered = true;
+    if (!run_mode_no_motor)
+    {
+        esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_SPEED_STABLE_EVENT, prm_speed_stable_event_handler);
+        esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_SPEED_STABLE_EVENT, prm_speed_stable_event_handler, motor_done_sem);
+        prm_speed_handler_registered = true;
+        esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_START_DONE_EVENT, prm_start_done_event_handler);
+        esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_START_DONE_EVENT, prm_start_done_event_handler, motor_start_done_queue);
+        prm_start_done_handler_registered = true;
+        esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_UNLOCK_DONE_EVENT, prm_unlock_done_event_handler);
+        esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_UNLOCK_DONE_EVENT, prm_unlock_done_event_handler, motor_unlock_done_queue);
+        prm_unlock_done_handler_registered = true;
+        esp_event_handler_unregister_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, prm_stop_done_event_handler);
+        esp_event_handler_register_with(pr_events_loop_handle, PRM, PRM_STOP_DONE_EVENT, prm_stop_done_event_handler, motor_stop_done_queue);
+        prm_stop_done_handler_registered = true;
+    }
 
     auto wait_queue_or_stop = [&](QueueHandle_t q, void *out_data, TickType_t timeout_ticks) -> bool {
         TickType_t start = xTaskGetTickCount();
@@ -468,7 +653,7 @@ void run_task(void *pvParameter)
 
         PRM_START_EVENT_DATA prm_start_event_data;
         prm_start_event_data.clockwise = run_clockwise ? PRM_DIRECTION_CLOCKWISE : PRM_DIRECTION_ANTICLOCKWISE;
-        if (!run_mode_small)
+        if (run_mode_big_profile)
         {
             float a = (esp_random() % 266 + 780) / 1000.0;
             float omega = (esp_random() % 116 + 1884) / 1000.0;
@@ -480,11 +665,17 @@ void run_task(void *pvParameter)
             ESP_LOGI(TAG_MAIN, "Starting motor in SIN tracing, amp = %f, omega = %f, b = %f", prm_start_event_data.amplitude, prm_start_event_data.omega, prm_start_event_data.offset);
             sprintf(log_string, "Starting motor in SIN tracing, amp = %f, omega = %f, b = %f", prm_start_event_data.amplitude, prm_start_event_data.omega, prm_start_event_data.offset);
         }
-        else
+        else if (run_mode_small_profile)
         {
             prm_start_event_data.mode = PRA_RUNE_SMALL_MODE;
             ESP_LOGI(TAG_MAIN, "Starting motor in constant speed mode");
             sprintf(log_string, "Starting motor in constant speed mode");
+        }
+        else
+        {
+            prm_start_event_data.mode = PRA_RUNE_SMALL_MODE;
+            ESP_LOGW(TAG_MAIN, "Unexpected run mode %u for motor profile, fallback to small constant speed", run_mode);
+            sprintf(log_string, "Fallback motor profile: small constant speed");
         }
         esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
 
@@ -701,6 +892,7 @@ void run_task(void *pvParameter)
     {
         bool round_success = true;
         bool user_stop = false;
+        bool suppress_round_result_log = false;
         uint8_t score = 0;
         xQueueReset(run_queue);
 #if PR_MAIN_MOTOR_ONLY_TEST
@@ -724,240 +916,884 @@ void run_task(void *pvParameter)
         circulation = 0;
         continue;
 #endif
-        bool need_start_this_round = true;
-        if (run_mode_small && circulation && motor_running)
+        if (run_mode_single_test)
         {
-            need_start_this_round = false;
-            ESP_LOGI(TAG_MAIN, "Small circulation: keep motor running for next round");
-        }
+            suppress_round_result_log = true;
+            const uint8_t target_address = (uint8_t)(run_test_leaf - 1);
+            PRA_START_EVENT_DATA single_start_event_data = {
+                .address = target_address,
+                .data_len = sizeof(PRA_START_EVENT_DATA),
+                .mode = PRA_RUNE_SMALL_MODE,
+                .color = run_color,
+            };
+            PRA_STOP_EVENT_DATA single_stop_event_data = {
+                .address = target_address,
+                .data_len = sizeof(PRA_STOP_EVENT_DATA),
+            };
+            auto arm_single_target = [&]() -> bool {
+                esp_event_post_to(pr_events_loop_handle, PRA, PRA_START_EVENT, &single_start_event_data, sizeof(PRA_START_EVENT_DATA), portMAX_DELAY);
+                if (!wait_send_ack("PRA_START_EVENT(single_test)"))
+                {
+                    ESP_LOGW(TAG_MAIN, "[SINGLE_TEST] PRA_START_EVENT ACK timeout");
+                    return false;
+                }
+                return true;
+            };
 
-        if (need_start_this_round)
-        {
-            if (!start_motor_for_round())
+            if (!arm_single_target())
             {
-                ESP_LOGW(TAG_MAIN, "start_motor_for_round failed, recovery disabled, abort this round");
-                circulation = 0;
+                circulation = false;
                 break;
             }
-            motor_running = true;
-        }
-        PRA_START_EVENT_DATA pra_start_event_data = {
-            .address = 0,
-            .data_len = sizeof(PRA_START_EVENT_DATA),
-            .mode = value[1],
-            .color = value[0],
-        };
-        PRA_COMPLETE_EVENT_DATA pra_complete_event_data;
 
-        if (value[1] == PRA_RUNE_SMALL_MODE)
-        {
-            // 小符模式：5块全部命中才成功
-            do
-                generate_rand_sequence(rune_start_sequence, 5);
-            while (rune_start_sequence[0] == last_first_activation_armour);
-            last_first_activation_armour = rune_start_sequence[0];
+            ESP_LOGI(TAG_MAIN, "[SINGLE_TEST] armed on armour %u", target_address + 1);
+            sprintf(log_string, "Single test armed: armour %u", target_address + 1);
+            esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
 
-            ESP_LOGI(TAG_MAIN, "Small Sequence: %i, %i, %i, %i, %i",
-                     rune_start_sequence[0], rune_start_sequence[1], rune_start_sequence[2], rune_start_sequence[3], rune_start_sequence[4]);
-
-            uint8_t started_count = 0;
-            for (uint8_t step = 0; step < 5; step++)
+            while (!g_run_stop_requested)
             {
-                uint8_t expected_address = rune_start_sequence[step] - 1;
-                pra_start_event_data.address = expected_address;
-                esp_event_post_to(pr_events_loop_handle, PRA, PRA_START_EVENT, &pra_start_event_data, sizeof(PRA_START_EVENT_DATA), portMAX_DELAY);
-                if (!wait_send_ack("PRA_START_EVENT"))
+                if (!wait_queue_or_stop(run_queue, &hit_done_data, small_hit_window))
+                {
+                    if (g_run_stop_requested)
+                    {
+                        user_stop = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                if (hit_done_data.address == 10)
+                {
+                    user_stop = true;
+                    break;
+                }
+
+                if (hit_done_data.address == 0xFF)
+                    continue;
+
+                if (hit_done_data.address != target_address)
+                {
+                    ESP_LOGW(TAG_MAIN, "[SINGLE_TEST] ignore hit armour %u, target %u",
+                             hit_done_data.address + 1, target_address + 1);
+                    continue;
+                }
+
+                ESP_LOGI(TAG_MAIN, "[SINGLE_TEST] target armour %u hit score +%u", target_address + 1, hit_done_data.score);
+                sprintf(log_string, "[SingleTest] Armour %u hit score +%u", target_address + 1, hit_done_data.score);
+                esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+
+                if (!arm_single_target())
                 {
                     round_success = false;
+                    circulation = false;
+                    break;
+                }
+            }
+
+            esp_event_post_to(pr_events_loop_handle, PRA, PRA_STOP_EVENT, &single_stop_event_data, sizeof(PRA_STOP_EVENT_DATA), portMAX_DELAY);
+            wait_send_ack("PRA_STOP_EVENT(single_test)");
+            circulation = false;
+            round_success = false;
+        }
+        else if (run_mode_single_score_test)
+        {
+            suppress_round_result_log = true;
+            const uint8_t all_addr[5] = {0, 1, 2, 3, 4};
+            const uint8_t target_address = (uint8_t)(run_test_leaf - 1);
+            PRA_START_EVENT_DATA single_score_start_event_data = {
+                .address = target_address,
+                .data_len = sizeof(PRA_START_EVENT_DATA),
+                .mode = PRA_RUNE_SMALL_MODE,
+                .color = run_color,
+            };
+            auto arm_single_score_target = [&]() -> bool {
+                esp_event_post_to(pr_events_loop_handle, PRA, PRA_START_EVENT, &single_score_start_event_data, sizeof(PRA_START_EVENT_DATA), portMAX_DELAY);
+                if (!wait_send_ack("PRA_START_EVENT(single_score_test)"))
+                {
+                    ESP_LOGW(TAG_MAIN, "[SINGLE_SCORE_TEST] PRA_START_EVENT ACK timeout");
+                    return false;
+                }
+                return true;
+            };
+
+            clear_gpa_score_history();
+            stop_armours(all_addr, 5);
+            if (!arm_single_score_target())
+            {
+                circulation = false;
+                round_success = false;
+                break;
+            }
+
+            ESP_LOGI(TAG_MAIN, "[SINGLE_SCORE_TEST] armed on armour %u", target_address + 1);
+            snprintf(log_string, sizeof(log_string), "Single score test armed: armour %u", target_address + 1);
+            esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+
+            while (!g_run_stop_requested)
+            {
+                if (!wait_queue_or_stop(run_queue, &hit_done_data, small_hit_window))
+                {
+                    if (g_run_stop_requested)
+                    {
+                        user_stop = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                if (hit_done_data.address == 10)
+                {
+                    user_stop = true;
+                    break;
+                }
+
+                if (hit_done_data.address == 0xFF)
+                    continue;
+
+                if (hit_done_data.address != target_address)
+                {
+                    ESP_LOGW(TAG_MAIN, "[SINGLE_SCORE_TEST] ignore hit armour %u, target %u",
+                             hit_done_data.address + 1, target_address + 1);
+                    continue;
+                }
+
+                update_gpa_score_history(hit_done_data.score);
+                ESP_LOGI(TAG_MAIN, "[SINGLE_SCORE_TEST] target armour %u hit score +%u", target_address + 1, hit_done_data.score);
+                snprintf(log_string, sizeof(log_string), "[SingleScoreTest] Armour %u hit score +%u", target_address + 1, hit_done_data.score);
+                esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+
+                if (!arm_single_score_target())
+                {
+                    round_success = false;
+                    circulation = false;
+                    break;
+                }
+            }
+
+            stop_armours(all_addr, 5);
+            circulation = false;
+            round_success = false;
+        }
+        else if (run_mode_small_4_hit_1_ready_test)
+        {
+            suppress_round_result_log = true;
+            const uint8_t all_addr[5] = {0, 1, 2, 3, 4};
+            uint8_t ready_leaf = run_test_leaf;
+            if (ready_leaf < 1)
+                ready_leaf = 1;
+            if (ready_leaf > 5)
+                ready_leaf = 5;
+            uint8_t progress_leaf_count = run_small_progress;
+            if (progress_leaf_count > 4)
+                progress_leaf_count = 4;
+            const uint8_t ready_address = ready_leaf - 1;
+            bool small_static_mask[5] = {false, false, false, false, false};
+            uint8_t filled = 0;
+            for (uint8_t i = 0; i < 5 && filled < progress_leaf_count; i++)
+            {
+                if (i == ready_address)
+                    continue;
+                small_static_mask[i] = true;
+                filled++;
+            }
+            PRA_START_EVENT_DATA small_test_start_event_data = {
+                .address = 0,
+                .data_len = sizeof(PRA_START_EVENT_DATA),
+                .mode = PRA_RUNE_SMALL_4_HIT_1_READY_TEST_MODE,
+                .color = run_color,
+                .big_group_index = 1,
+                .big_target_armed = 1,
+            };
+            auto apply_small_test_layout = [&]() -> bool {
+                for (uint8_t i = 0; i < 5; i++)
+                {
+                    if (i == ready_address || small_static_mask[i])
+                    {
+                        small_test_start_event_data.address = i;
+                        small_test_start_event_data.mode = (i == ready_address) ? PRA_RUNE_SMALL_4_HIT_1_READY_TEST_MODE : PRA_RUNE_SMALL_HIT_STATIC_MODE;
+                        esp_event_post_to(pr_events_loop_handle, PRA, PRA_START_EVENT, &small_test_start_event_data, sizeof(PRA_START_EVENT_DATA), portMAX_DELAY);
+                        if (!wait_send_ack("PRA_START_EVENT(small_progress_ready)"))
+                            return false;
+                    }
+                    else
+                    {
+                        PRA_STOP_EVENT_DATA small_test_stop_event_data = {
+                            .address = i,
+                        };
+                        esp_event_post_to(pr_events_loop_handle, PRA, PRA_STOP_EVENT, &small_test_stop_event_data, sizeof(PRA_STOP_EVENT_DATA), portMAX_DELAY);
+                        if (!wait_send_ack("PRA_STOP_EVENT(small_progress_ready)"))
+                            return false;
+                    }
+                }
+                return true;
+            };
+
+            if (!start_motor_for_round())
+            {
+                ESP_LOGW(TAG_MAIN, "[SMALL_TEST_FIXED] start_motor_for_round failed, abort");
+                round_success = false;
+                circulation = false;
+            }
+            else
+            {
+                motor_running = true;
+            }
+
+            if (round_success && !apply_small_test_layout())
+            {
+                round_success = false;
+                circulation = false;
+            }
+
+            if (round_success)
+            {
+                ESP_LOGI(TAG_MAIN, "Small test staged layout armed: progress=%u/4 ready=%u", progress_leaf_count, ready_address + 1);
+                snprintf(log_string, sizeof(log_string), "Small test staged: progress=%u/4 ready=%u", progress_leaf_count, ready_address + 1);
+                esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+
+                while (!g_run_stop_requested)
+                {
+                    if (!wait_queue_or_stop(run_queue, &hit_done_data, 500 / portTICK_PERIOD_MS))
+                    {
+                        if (g_run_stop_requested)
+                        {
+                            user_stop = true;
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if (hit_done_data.address == 10)
+                    {
+                        user_stop = true;
+                        break;
+                    }
+
+                    if (hit_done_data.address == 0xFF)
+                        continue;
+
+                    if (hit_done_data.address != ready_address)
+                    {
+                        ESP_LOGI(TAG_MAIN, "[SMALL_TEST_FIXED] ignore hit armour %u score %u", hit_done_data.address + 1, hit_done_data.score);
+                        continue;
+                    }
+
+                    notify_test_hit_score("Small4Hit1ReadyTest", ready_address, hit_done_data.score);
+                    if (!apply_small_test_layout())
+                    {
+                        round_success = false;
+                        circulation = false;
+                        break;
+                    }
+                }
+            }
+
+            stop_armours(all_addr, 5);
+            circulation = false;
+            round_success = false;
+        }
+        else if (run_mode_big_progress_2_ready_test)
+        {
+            suppress_round_result_log = true;
+            const uint8_t all_addr[5] = {0, 1, 2, 3, 4};
+            uint8_t progress_step = run_test_leaf;
+            if (progress_step < 1)
+                progress_step = 1;
+            if (progress_step > 5)
+                progress_step = 5;
+            const uint8_t progress_stage = progress_step - 1;
+            const uint8_t ready_a_addr = run_big_ready_a - 1;
+            const uint8_t ready_b_addr = run_big_ready_b - 1;
+
+            PRA_START_EVENT_DATA big_test_start_event_data = {
+                .address = 0,
+                .data_len = sizeof(PRA_START_EVENT_DATA),
+                .mode = PRA_RUNE_BIG_PROGRESS_2_READY_TEST_MODE,
+                .color = run_color,
+                .big_group_index = progress_step,
+                .big_target_armed = 0,
+            };
+            auto apply_big_test_layout = [&]() -> bool {
+                for (uint8_t i = 0; i < 5; i++)
+                {
+                    big_test_start_event_data.address = i;
+                    big_test_start_event_data.big_target_armed = (i == ready_a_addr || i == ready_b_addr) ? 1 : 0;
+                    esp_event_post_to(pr_events_loop_handle, PRA, PRA_START_EVENT, &big_test_start_event_data, sizeof(PRA_START_EVENT_DATA), portMAX_DELAY);
+                    if (!wait_send_ack("PRA_START_EVENT(big_progress_2_ready)"))
+                        return false;
+                }
+                return true;
+            };
+
+            if (!start_motor_for_round())
+            {
+                ESP_LOGW(TAG_MAIN, "[BIG_TEST_STAGED] start_motor_for_round failed, abort");
+                round_success = false;
+                circulation = false;
+            }
+            else
+            {
+                motor_running = true;
+            }
+
+            if (round_success && !apply_big_test_layout())
+            {
+                round_success = false;
+                circulation = false;
+            }
+
+            if (round_success)
+            {
+                ESP_LOGI(TAG_MAIN, "Big test staged layout armed: progress=%u/5 ready=%u,%u", progress_stage, ready_a_addr + 1, ready_b_addr + 1);
+                snprintf(log_string, sizeof(log_string), "Big test staged: progress=%u/5 ready=%u,%u", progress_stage, ready_a_addr + 1, ready_b_addr + 1);
+                esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+
+                while (!g_run_stop_requested)
+                {
+                    if (!wait_queue_or_stop(run_queue, &hit_done_data, 500 / portTICK_PERIOD_MS))
+                    {
+                        if (g_run_stop_requested)
+                        {
+                            user_stop = true;
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if (hit_done_data.address == 10)
+                    {
+                        user_stop = true;
+                        break;
+                    }
+
+                    if (hit_done_data.address == 0xFF)
+                        continue;
+
+                    if (hit_done_data.address != ready_a_addr && hit_done_data.address != ready_b_addr)
+                    {
+                        ESP_LOGI(TAG_MAIN, "[BIG_TEST_STAGED] ignore hit armour %u score %u", hit_done_data.address + 1, hit_done_data.score);
+                        continue;
+                    }
+
+                    notify_test_hit_score("BigProgress2ReadyTest", hit_done_data.address, hit_done_data.score);
+                    if (!apply_big_test_layout())
+                    {
+                        round_success = false;
+                        circulation = false;
+                        break;
+                    }
+                }
+            }
+
+            stop_armours(all_addr, 5);
+            circulation = false;
+            round_success = false;
+        }
+        else if (run_mode_all_target_ready || run_mode_all_success_static)
+        {
+            const uint8_t all_addr[5] = {0, 1, 2, 3, 4};
+            PRA_START_EVENT_DATA all_start_event_data = {
+                .address = 0,
+                .data_len = sizeof(PRA_START_EVENT_DATA),
+                .mode = run_mode,
+                .color = run_color,
+                .big_group_index = 1,
+                .big_target_armed = 1,
+            };
+
+            for (uint8_t i = 0; i < 5; i++)
+            {
+                all_start_event_data.address = i;
+                esp_event_post_to(pr_events_loop_handle, PRA, PRA_START_EVENT, &all_start_event_data, sizeof(PRA_START_EVENT_DATA), portMAX_DELAY);
+                if (!wait_send_ack("PRA_START_EVENT(all_modes)"))
+                {
+                    round_success = false;
+                    circulation = false;
+                    break;
+                }
+            }
+
+            if (round_success)
+            {
+                const char *mode_log = run_mode_all_target_ready ? "All target ready mode armed" : "All success static mode armed";
+                ESP_LOGI(TAG_MAIN, "%s", mode_log);
+                snprintf(log_string, sizeof(log_string), "%s", mode_log);
+                esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+
+                while (!g_run_stop_requested)
+                {
+                    if (!wait_queue_or_stop(run_queue, &hit_done_data, 500 / portTICK_PERIOD_MS))
+                    {
+                        if (g_run_stop_requested)
+                        {
+                            user_stop = true;
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if (hit_done_data.address == 10)
+                    {
+                        user_stop = true;
+                        break;
+                    }
+
+                    if (hit_done_data.address == 0xFF)
+                        continue;
+
+                    ESP_LOGI(TAG_MAIN, "[ALL_MODE] ignore hit armour %u score %u", hit_done_data.address + 1, hit_done_data.score);
+                }
+            }
+
+            stop_armours(all_addr, 5);
+            circulation = false;
+            round_success = false;
+        }
+        else
+        {
+            bool need_start_this_round = true;
+            if (run_mode_small && circulation && motor_running)
+            {
+                need_start_this_round = false;
+                ESP_LOGI(TAG_MAIN, "Small circulation: keep motor running for next round");
+            }
+
+            if (need_start_this_round)
+            {
+                if (!start_motor_for_round())
+                {
+                    ESP_LOGW(TAG_MAIN, "start_motor_for_round failed, recovery disabled, abort this round");
                     circulation = 0;
                     break;
                 }
-                started_count++;
-
-                if (!wait_queue_or_stop(run_queue, &hit_done_data, small_hit_window))
+                motor_running = true;
+            }
+            PRA_START_EVENT_DATA pra_start_event_data = {
+                .address = 0,
+                .data_len = sizeof(PRA_START_EVENT_DATA),
+                .mode = run_mode,
+                .color = run_color,
+            };
+            PRA_COMPLETE_EVENT_DATA pra_complete_event_data;
+            const uint8_t all_addr[5] = {0, 1, 2, 3, 4};
+            constexpr uint8_t complete_ack_max_retry = 3;
+            auto drain_run_queue = [&]() {
+                if (run_queue == NULL)
+                    return;
+                PRA_HIT_EVENT_DATA stale_hit_data = {};
+                while (xQueueReceive(run_queue, &stale_hit_data, 0) == pdTRUE)
+                {
+                    if (stale_hit_data.address != 0xFF)
+                    {
+                        ESP_LOGW(TAG_MAIN, "[HIT] drain stale event addr=%u score=%u", stale_hit_data.address, stale_hit_data.score);
+                    }
+                }
+            };
+            auto send_complete_with_retry = [&](uint8_t address) -> bool {
+                for (uint8_t retry = 0; retry < complete_ack_max_retry; retry++)
+                {
+                    pra_complete_event_data.address = address;
+                    esp_event_post_to(pr_events_loop_handle, PRA, PRA_COMPLETE_EVENT, &pra_complete_event_data, sizeof(PRA_COMPLETE_EVENT_DATA), portMAX_DELAY);
+                    if (wait_send_ack("PRA_COMPLETE_EVENT"))
+                        return true;
+                    ESP_LOGW(TAG_MAIN, "PRA_COMPLETE_EVENT ACK timeout on armour %u retry %u/%u",
+                             address + 1, retry + 1, complete_ack_max_retry);
+                }
+                return false;
+            };
+            auto wait_window_ignoring_hits = [&](TickType_t window_ticks, const char *window_tag) -> bool {
+                TickType_t begin = xTaskGetTickCount();
+                while ((xTaskGetTickCount() - begin) < window_ticks)
                 {
                     if (g_run_stop_requested)
                     {
                         user_stop = true;
                         circulation = 0;
                         round_success = false;
+                        return false;
+                    }
+
+                    TickType_t elapsed = xTaskGetTickCount() - begin;
+                    TickType_t remain = window_ticks - elapsed;
+                    TickType_t chunk = (remain > wait_poll_ticks) ? wait_poll_ticks : remain;
+                    if (xQueueReceive(run_queue, &hit_done_data, chunk) != pdTRUE)
+                        continue;
+
+                    if (hit_done_data.address == 10)
+                    {
+                        user_stop = true;
+                        circulation = 0;
+                        round_success = false;
+                        return false;
+                    }
+
+                    if (hit_done_data.address == 0xFF)
+                        continue;
+
+                    ESP_LOGI(TAG_MAIN, "[AUTO_SUCCESS] ignore hit armour %u score %u during %s window",
+                             hit_done_data.address + 1, hit_done_data.score, window_tag);
+                }
+                return true;
+            };
+
+            if (run_mode == PRA_RUNE_SMALL_MODE)
+            {
+                // 小符模式：5块全部命中才成功
+                do
+                    generate_rand_sequence(rune_start_sequence, 5);
+                while (rune_start_sequence[0] == last_first_activation_armour);
+                last_first_activation_armour = rune_start_sequence[0];
+
+                ESP_LOGI(TAG_MAIN, "Small Sequence: %i, %i, %i, %i, %i",
+                         rune_start_sequence[0], rune_start_sequence[1], rune_start_sequence[2], rune_start_sequence[3], rune_start_sequence[4]);
+
+                pra_start_event_data.big_group_index = 1;
+                bool small_hit_mask[5] = {false, false, false, false, false};
+                auto apply_small_round_layout = [&](uint8_t expected_address) -> bool {
+                    for (uint8_t addr = 0; addr < 5; addr++)
+                    {
+                        pra_start_event_data.address = addr;
+                        if (small_hit_mask[addr])
+                        {
+                            pra_start_event_data.mode = PRA_RUNE_SMALL_HIT_STATIC_MODE;
+                            pra_start_event_data.big_target_armed = 1;
+                        }
+                        else
+                        {
+                            pra_start_event_data.mode = PRA_RUNE_SMALL_MODE;
+                            pra_start_event_data.big_target_armed = (addr == expected_address) ? 1 : 0;
+                        }
+                        esp_event_post_to(pr_events_loop_handle, PRA, PRA_START_EVENT, &pra_start_event_data, sizeof(PRA_START_EVENT_DATA), portMAX_DELAY);
+                        if (!wait_send_ack("PRA_START_EVENT"))
+                            return false;
+                    }
+                    return true;
+                };
+                for (uint8_t step = 0; step < 5; step++)
+                {
+                    uint8_t expected_address = rune_start_sequence[step] - 1;
+                    if (!apply_small_round_layout(expected_address))
+                    {
+                        round_success = false;
+                        circulation = 0;
                         break;
                     }
-                    ESP_LOGW(TAG_MAIN, "[HIT] timeout from armour %d", expected_address + 1);
-                    round_success = false;
-                    break;
-                }
-                if (hit_done_data.address == 10)
-                {
-                    user_stop = true;
-                    circulation = 0;
-                    round_success = false;
-                    break;
-                }
-                if (hit_done_data.address != expected_address)
-                {
-                    ESP_LOGW(TAG_MAIN, "[HIT] mistaken armour %d, expected %d", hit_done_data.address + 1, expected_address + 1);
-                    round_success = false;
-                    break;
-                }
-                score += hit_done_data.score;
-                ESP_LOGI(TAG_MAIN, "[HIT] armour %d score +%d", expected_address + 1, hit_done_data.score);
-            }
 
-            if (!round_success)
-            {
-                for (uint8_t i = 0; i < started_count; i++)
+                    // 每步开始前清空残留命中，避免上一步尾包干扰当前目标判定
+                    drain_run_queue();
+                    bool got_expected_hit = false;
+                    TickType_t step_begin = xTaskGetTickCount();
+                    while ((xTaskGetTickCount() - step_begin) < small_hit_window)
+                    {
+                        TickType_t step_elapsed = xTaskGetTickCount() - step_begin;
+                        TickType_t step_remain = small_hit_window - step_elapsed;
+                        if (!wait_queue_or_stop(run_queue, &hit_done_data, step_remain))
+                        {
+                            if (g_run_stop_requested)
+                            {
+                                user_stop = true;
+                                circulation = 0;
+                                round_success = false;
+                            }
+                            break;
+                        }
+
+                        if (hit_done_data.address == 10)
+                        {
+                            user_stop = true;
+                            circulation = 0;
+                            round_success = false;
+                            break;
+                        }
+
+                        if (hit_done_data.address == expected_address)
+                        {
+                            score += hit_done_data.score;
+                            ESP_LOGI(TAG_MAIN, "[HIT] armour %d score +%d", expected_address + 1, hit_done_data.score);
+                            small_hit_mask[expected_address] = true;
+                            got_expected_hit = true;
+                            break;
+                        }
+
+                        if (hit_done_data.address == 0xFF)
+                            continue;
+
+                        ESP_LOGI(TAG_MAIN, "[HIT] ignore non-target armour %d, expected %d",
+                                 hit_done_data.address + 1, expected_address + 1);
+                        continue;
+                    }
+                    if (!round_success)
+                        break;
+                    if (!got_expected_hit)
+                    {
+                        ESP_LOGW(TAG_MAIN, "[HIT] timeout waiting target armour %d", expected_address + 1);
+                        round_success = false;
+                        break;
+                    }
+                }
+
+                if (!round_success)
                 {
-                    uint8_t addr = rune_start_sequence[i] - 1;
-                    stop_armours(&addr, 1);
+                    stop_armours(all_addr, 5);
+                }
+                else
+                {
+                    bool complete_delivery_ok = true;
+                    for (uint8_t i = 0; i < 5; i++)
+                    {
+                        if (!send_complete_with_retry(i))
+                        {
+                            complete_delivery_ok = false;
+                            ESP_LOGW(TAG_MAIN, "Small mode COMPLETE delivery failed on armour %u", i + 1);
+                            break;
+                        }
+                    }
+                    if (!complete_delivery_ok)
+                    {
+                        round_success = false;
+                    }
+                    if (round_success)
+                    {
+                        vTaskDelay(5000 / portTICK_PERIOD_MS);
+                    }
+                    stop_armours(all_addr, 5);
+                }
+            }
+            else if (run_mode_auto_success)
+            {
+                // 自动成功模式：复用大符正式节奏，但所有检测窗口默认通过并在最后显示成功等效
+                pra_start_event_data.mode = PRA_RUNE_BIG_MODE;
+                for (uint8_t group = 0; group < 5; group++)
+                {
+                    generate_rand_sequence(rune_start_sequence, 5);
+                    uint8_t active_addr[2] = {(uint8_t)(rune_start_sequence[0] - 1), (uint8_t)(rune_start_sequence[1] - 1)};
+                    ESP_LOGI(TAG_MAIN, "AutoSuccess Group %u targets: %u, %u", group + 1, active_addr[0] + 1, active_addr[1] + 1);
+                    snprintf(log_string, sizeof(log_string), "AutoSuccess Group %u/5 targets: %u,%u", group + 1, active_addr[0] + 1, active_addr[1] + 1);
+                    esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+
+                    for (uint8_t addr = 0; addr < 5; addr++)
+                    {
+                        pra_start_event_data.address = addr;
+                        pra_start_event_data.big_group_index = group + 1;
+                        pra_start_event_data.big_target_armed = (addr == active_addr[0] || addr == active_addr[1]) ? 1 : 0;
+                        esp_event_post_to(pr_events_loop_handle, PRA, PRA_START_EVENT, &pra_start_event_data, sizeof(PRA_START_EVENT_DATA), portMAX_DELAY);
+                        if (!wait_send_ack("PRA_START_EVENT(auto_success)"))
+                        {
+                            round_success = false;
+                            circulation = 0;
+                            break;
+                        }
+                    }
+                    if (!round_success)
+                        break;
+
+                    drain_run_queue();
+                    if (!wait_window_ignoring_hits(big_first_hit_window, "first"))
+                        break;
+                    if (!wait_window_ignoring_hits(big_second_hit_window, "second"))
+                        break;
+
+                    snprintf(log_string, sizeof(log_string), "AutoSuccess progress %u/5", group + 1);
+                    esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+
+                    if (group < 4)
+                    {
+                        stop_armours(all_addr, 5);
+                    }
+                }
+
+                if (!round_success)
+                {
+                    stop_armours(all_addr, 5);
+                }
+                else
+                {
+                    bool complete_delivery_ok = true;
+                    for (uint8_t i = 0; i < 5; i++)
+                    {
+                        if (!send_complete_with_retry(i))
+                        {
+                            complete_delivery_ok = false;
+                            ESP_LOGW(TAG_MAIN, "AutoSuccess COMPLETE delivery failed on armour %u", i + 1);
+                            break;
+                        }
+                    }
+                    if (!complete_delivery_ok)
+                    {
+                        round_success = false;
+                        stop_armours(all_addr, 5);
+                    }
+                    else
+                    {
+                        vTaskDelay(5000 / portTICK_PERIOD_MS);
+                        stop_armours(all_addr, 5);
+                    }
                 }
             }
             else
             {
-                for (uint8_t i = 0; i < 5; i++)
+                // 大符模式：5组，每组点亮2块；首击2.5s，次击可选1s；5组都成功才算成功
+                for (uint8_t group = 0; group < 5; group++)
                 {
-                    pra_complete_event_data.address = i;
-                    esp_event_post_to(pr_events_loop_handle, PRA, PRA_COMPLETE_EVENT, &pra_complete_event_data, sizeof(PRA_COMPLETE_EVENT_DATA), portMAX_DELAY);
-                    wait_send_ack("PRA_COMPLETE_EVENT");
+                    generate_rand_sequence(rune_start_sequence, 5);
+                    uint8_t active_addr[2] = {(uint8_t)(rune_start_sequence[0] - 1), (uint8_t)(rune_start_sequence[1] - 1)};
+                    ESP_LOGI(TAG_MAIN, "Big Group %u targets: %u, %u", group + 1, active_addr[0] + 1, active_addr[1] + 1);
+                    sprintf(log_string, "Big Group %u/5 targets: %u,%u", group + 1, active_addr[0] + 1, active_addr[1] + 1);
+                    esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+
+                    for (uint8_t addr = 0; addr < 5; addr++)
+                    {
+                        pra_start_event_data.address = addr;
+                        pra_start_event_data.big_group_index = group + 1;
+                        pra_start_event_data.big_target_armed = (addr == active_addr[0] || addr == active_addr[1]) ? 1 : 0;
+                        esp_event_post_to(pr_events_loop_handle, PRA, PRA_START_EVENT, &pra_start_event_data, sizeof(PRA_START_EVENT_DATA), portMAX_DELAY);
+                        if (!wait_send_ack("PRA_START_EVENT"))
+                        {
+                            round_success = false;
+                            circulation = 0;
+                            break;
+                        }
+                    }
+                    if (!round_success)
+                        break;
+
+                    // 每组开始前清空残留命中，避免上一组尾包误判本组首击
+                    drain_run_queue();
+                    bool first_hit_ok = false;
+                    uint8_t first_hit_addr = 0xFF;
+                    TickType_t begin = xTaskGetTickCount();
+                    while ((xTaskGetTickCount() - begin) < big_first_hit_window)
+                    {
+                        TickType_t elapsed = xTaskGetTickCount() - begin;
+                        TickType_t remain = big_first_hit_window - elapsed;
+                        if (!wait_queue_or_stop(run_queue, &hit_done_data, remain))
+                            break;
+
+                        if (hit_done_data.address == 10)
+                        {
+                            user_stop = true;
+                            circulation = 0;
+                            round_success = false;
+                            break;
+                        }
+                        if (hit_done_data.address == active_addr[0] || hit_done_data.address == active_addr[1])
+                        {
+                            first_hit_ok = true;
+                            first_hit_addr = hit_done_data.address;
+                            score += hit_done_data.score;
+                            ESP_LOGI(TAG_MAIN, "[HIT] Big Group %u first hit armour %u score +%u", group + 1, first_hit_addr + 1, hit_done_data.score);
+                            // 命中后立即熄灭该片
+                            stop_armours(&first_hit_addr, 1);
+                            // 清掉首击尾包，避免次击窗口误收到同一次击打残留
+                            drain_run_queue();
+                            break;
+                        }
+                        if (hit_done_data.address == 0xFF)
+                            continue;
+
+                        ESP_LOGI(TAG_MAIN, "Big Group %u ignore non-target first hit armour %u, targets %u,%u",
+                                 group + 1,
+                                 hit_done_data.address + 1,
+                                 active_addr[0] + 1,
+                                 active_addr[1] + 1);
+                        continue;
+                    }
+                    if (!round_success)
+                        break;
+                    if (!first_hit_ok)
+                    {
+                        ESP_LOGW(TAG_MAIN, "Big Group %u failed: no hit in 2.5s", group + 1);
+                        round_success = false;
+                        break;
+                    }
+
+                    // 次击可选窗口1s，不影响本组成败
+                    uint8_t second_target = (first_hit_addr == active_addr[0]) ? active_addr[1] : active_addr[0];
+                    begin = xTaskGetTickCount();
+                    while ((xTaskGetTickCount() - begin) < big_second_hit_window)
+                    {
+                        TickType_t elapsed = xTaskGetTickCount() - begin;
+                        TickType_t remain = big_second_hit_window - elapsed;
+                        if (!wait_queue_or_stop(run_queue, &hit_done_data, remain))
+                            break;
+                        if (hit_done_data.address == 10)
+                        {
+                            user_stop = true;
+                            circulation = 0;
+                            round_success = false;
+                            break;
+                        }
+                        if (hit_done_data.address == second_target)
+                        {
+                            score += hit_done_data.score;
+                            ESP_LOGI(TAG_MAIN, "[HIT] Big Group %u second hit armour %u score +%u", group + 1, second_target + 1, hit_done_data.score);
+                            // 命中后立即熄灭该片
+                            stop_armours(&second_target, 1);
+                            break;
+                        }
+                        if (hit_done_data.address == 0xFF)
+                            continue;
+
+                        ESP_LOGI(TAG_MAIN, "Big Group %u ignore non-target second hit armour %u, expected %u",
+                                 group + 1,
+                                 hit_done_data.address + 1,
+                                 second_target + 1);
+                        continue;
+                    }
+                    if (!round_success)
+                        break;
+
+                    sprintf(log_string, "Big progress %u/5", group + 1);
+                    esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
+
+                    // 不论是否打到第二块，本组结束都切换下一组
+                    // 最后一组先保留状态，交给 COMPLETE 成功等效统一收尾，避免最后一片残留靶面灯效
+                    if (group < 4)
+                    {
+                        stop_armours(all_addr, 5);
+                    }
                 }
-                vTaskDelay(5000 / portTICK_PERIOD_MS);
-                uint8_t all_addr[5] = {0, 1, 2, 3, 4};
-                stop_armours(all_addr, 5);
+
+                if (!round_success)
+                {
+                    // 失败收敛：统一停掉5片，避免残留TARGET状态导致下一轮状态混乱
+                    stop_armours(all_addr, 5);
+                }
+                else
+                {
+                    // 大符5组都成功，触发成功等效
+                    bool complete_delivery_ok = true;
+                    for (uint8_t i = 0; i < 5; i++)
+                    {
+                        if (!send_complete_with_retry(i))
+                        {
+                            complete_delivery_ok = false;
+                            ESP_LOGW(TAG_MAIN, "Big mode COMPLETE delivery failed on armour %u", i + 1);
+                            break;
+                        }
+                    }
+                    if (!complete_delivery_ok)
+                    {
+                        round_success = false;
+                        stop_armours(all_addr, 5);
+                    }
+                    else
+                    {
+                        vTaskDelay(5000 / portTICK_PERIOD_MS);
+                        stop_armours(all_addr, 5);
+                    }
+                }
             }
         }
-        else
+
+        if (!run_mode_no_motor && round_success)
         {
-            // 大符模式：5组，每组点亮2块；首击2.5s，次击可选1s；5组都成功才算成功
-            for (uint8_t group = 0; group < 5; group++)
-            {
-                generate_rand_sequence(rune_start_sequence, 5);
-                uint8_t active_addr[2] = {(uint8_t)(rune_start_sequence[0] - 1), (uint8_t)(rune_start_sequence[1] - 1)};
-                ESP_LOGI(TAG_MAIN, "Big Group %u targets: %u, %u", group + 1, active_addr[0] + 1, active_addr[1] + 1);
-                sprintf(log_string, "Big Group %u/5 targets: %u,%u", group + 1, active_addr[0] + 1, active_addr[1] + 1);
-                esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
-
-                for (uint8_t i = 0; i < 2; i++)
-                {
-                    pra_start_event_data.address = active_addr[i];
-                    esp_event_post_to(pr_events_loop_handle, PRA, PRA_START_EVENT, &pra_start_event_data, sizeof(PRA_START_EVENT_DATA), portMAX_DELAY);
-                    if (!wait_send_ack("PRA_START_EVENT"))
-                    {
-                        round_success = false;
-                        circulation = 0;
-                        break;
-                    }
-                }
-                if (!round_success)
-                    break;
-
-                bool first_hit_ok = false;
-                uint8_t first_hit_addr = 0xFF;
-                TickType_t begin = xTaskGetTickCount();
-                while ((xTaskGetTickCount() - begin) < big_first_hit_window)
-                {
-                    TickType_t elapsed = xTaskGetTickCount() - begin;
-                    TickType_t remain = big_first_hit_window - elapsed;
-                    if (!wait_queue_or_stop(run_queue, &hit_done_data, remain))
-                        break;
-
-                    if (hit_done_data.address == 10)
-                    {
-                        user_stop = true;
-                        circulation = 0;
-                        round_success = false;
-                        break;
-                    }
-                    if (hit_done_data.address == active_addr[0] || hit_done_data.address == active_addr[1])
-                    {
-                        first_hit_ok = true;
-                        first_hit_addr = hit_done_data.address;
-                        score += hit_done_data.score;
-                        ESP_LOGI(TAG_MAIN, "[HIT] Big Group %u first hit armour %u score +%u", group + 1, first_hit_addr + 1, hit_done_data.score);
-                        // 命中后立即熄灭该片
-                        stop_armours(&first_hit_addr, 1);
-                        break;
-                    }
-                }
-                if (!round_success)
-                    break;
-                if (!first_hit_ok)
-                {
-                    ESP_LOGW(TAG_MAIN, "Big Group %u failed: no hit in 2.5s", group + 1);
-                    round_success = false;
-                    stop_armours(active_addr, 2);
-                    break;
-                }
-
-                // 次击可选窗口1s，不影响本组成败
-                uint8_t second_target = (first_hit_addr == active_addr[0]) ? active_addr[1] : active_addr[0];
-                begin = xTaskGetTickCount();
-                while ((xTaskGetTickCount() - begin) < big_second_hit_window)
-                {
-                    TickType_t elapsed = xTaskGetTickCount() - begin;
-                    TickType_t remain = big_second_hit_window - elapsed;
-                    if (!wait_queue_or_stop(run_queue, &hit_done_data, remain))
-                        break;
-                    if (hit_done_data.address == 10)
-                    {
-                        user_stop = true;
-                        circulation = 0;
-                        round_success = false;
-                        break;
-                    }
-                    if (hit_done_data.address == second_target)
-                    {
-                        score += hit_done_data.score;
-                        ESP_LOGI(TAG_MAIN, "[HIT] Big Group %u second hit armour %u score +%u", group + 1, second_target + 1, hit_done_data.score);
-                        // 命中后立即熄灭该片
-                        stop_armours(&second_target, 1);
-                        break;
-                    }
-                }
-                if (!round_success)
-                    break;
-
-                sprintf(log_string, "Big progress %u/5", group + 1);
-                esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
-
-                // 不论是否打到第二块，本组结束都切换下一组
-                // 最后一组先保留状态，交给 COMPLETE 成功等效统一收尾，避免最后一片残留靶面灯效
-                if (group < 4)
-                {
-                    stop_armours(active_addr, 2);
-                }
-            }
-
-            if (round_success)
-            {
-                // 大符5组都成功，触发成功等效
-                for (uint8_t i = 0; i < 5; i++)
-                {
-                    pra_complete_event_data.address = i;
-                    esp_event_post_to(pr_events_loop_handle, PRA, PRA_COMPLETE_EVENT, &pra_complete_event_data, sizeof(PRA_COMPLETE_EVENT_DATA), portMAX_DELAY);
-                    wait_send_ack("PRA_COMPLETE_EVENT");
-                }
-                vTaskDelay(5000 / portTICK_PERIOD_MS);
-                uint8_t all_addr[5] = {0, 1, 2, 3, 4};
-                stop_armours(all_addr, 5);
-            }
-        }
-
-        if (round_success)
-        {
-            score_vector.push_back(score);
-            size_t len = score_vector.size();
-            memset(ops_gpa_val, 0, sizeof(ops_gpa_val));
-            for (size_t i = 0; i < 10 && i < len; i++)
-            {
-                ops_gpa_val[i] = score_vector[len - 1 - i];
-            }
-            esp_ble_gatts_set_attr_value(ops_handle_table[GPA_VAL], sizeof(ops_gpa_val), ops_gpa_val);
-
+            update_gpa_score_history(score);
             ESP_LOGI(TAG_MAIN, "[Score: %d]PowerRune Activated Successfully", score);
             sprintf(log_string, "[Score: %d]PowerRune Activated Successfully", score);
             esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[RUN_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
         }
-        else if (!user_stop)
+        else if (!suppress_round_result_log && !user_stop)
         {
             ESP_LOGW(TAG_MAIN, "PowerRune Activation Failed");
             sprintf(log_string, "PowerRune Activation Failed");
@@ -965,7 +1801,7 @@ void run_task(void *pvParameter)
         }
 
         // 单次模式：本轮结束后立即停电机
-        if (!circulation && !motor_stopped)
+        if (!run_mode_no_motor && !circulation && !motor_stopped)
         {
             if (stop_motor_reliably("PRM_STOP_EVENT(single)"))
             {
@@ -985,7 +1821,7 @@ void run_task(void *pvParameter)
     // 恢复空闲灯效
     pra_stop(NULL, NULL, 0, NULL);
     // 发送STOP到PRM
-    if (!motor_stopped)
+    if (!run_mode_no_motor && !motor_stopped)
     {
         if (!stop_motor_reliably("PRM_STOP_EVENT(final)"))
         {
@@ -1105,10 +1941,7 @@ void ota_task(void *pvParameter)
     }
     // 更新自己
     ota_begin_event_data.address = 0x06;
-    // LED Strip 清空
-    vTaskSuspend(led_animation_task_handle);
-    led_strip->clear_pixels();
-    led_strip->refresh();
+    set_logo_off_mode();
     sprintf(log_string, "Starting OTA for PowerRune Server");
     esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, ops_handle_table[OTA_VAL], strlen(log_string) + 1, (uint8_t *)log_string, false);
 
@@ -1194,35 +2027,149 @@ void reset_armour_id_task(void *pvParameter)
     vTaskDelete(NULL);
 }
 
+// 7x7蛇形映射：第1行左->右，第2行右->左，依次类推
+static inline uint16_t map_logo_logical_to_physical(uint16_t logical_index)
+{
+    const uint16_t cols = 7;
+    const uint16_t total = 49;
+    if (logical_index >= total)
+        return logical_index;
+    uint16_t row = logical_index / cols;
+    uint16_t col = logical_index % cols;
+    if ((row & 0x01) == 0)
+        return row * cols + col;
+    return row * cols + (cols - 1 - col);
+}
+
+static inline void hsv_to_rgb_u8(uint8_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    if (s == 0)
+    {
+        *r = v;
+        *g = v;
+        *b = v;
+        return;
+    }
+
+    uint8_t region = h / 43;               // 256 / 6 ~= 43
+    uint8_t remainder = (h - region * 43) * 6;
+    uint8_t p = (uint8_t)((uint16_t)v * (255 - s) / 255);
+    uint8_t q = (uint8_t)((uint16_t)v * (255 - (uint16_t)s * remainder / 255) / 255);
+    uint8_t t = (uint8_t)((uint16_t)v * (255 - (uint16_t)s * (255 - remainder) / 255) / 255);
+
+    switch (region)
+    {
+    case 0:
+        *r = v;
+        *g = t;
+        *b = p;
+        break;
+    case 1:
+        *r = q;
+        *g = v;
+        *b = p;
+        break;
+    case 2:
+        *r = p;
+        *g = v;
+        *b = t;
+        break;
+    case 3:
+        *r = p;
+        *g = q;
+        *b = v;
+        break;
+    case 4:
+        *r = t;
+        *g = p;
+        *b = v;
+        break;
+    default:
+        *r = v;
+        *g = p;
+        *b = q;
+        break;
+    }
+}
+
 void led_animation_task(void *pvParameter)
 {
-    uint16_t sequence[] = {1, 2, 3, 4, 5, 13, 20, 27, 34, 41, 47, 46, 45, 44, 43, 35, 28, 21, 14, 7};
-    uint8_t sequence_len = sizeof(sequence) / sizeof(sequence[0]); // 20
-    uint8_t line_len = 15;
+    const uint16_t logo_pixel_count = 49;
+    uint16_t mono_breath_phase = 0; // 0~511
+    uint8_t flow_phase = 0;
+    uint8_t base_hue = 0;
     const PowerRune_Rlogo_config_info_t *config_rlogo = config->get_config_info_pt();
     while (1)
     {
         config_rlogo = config->get_config_info_pt();
-        for (int i = 0; i < sequence_len; i++)
+        const uint8_t animation_mode = g_logo_animation_mode;
+        const uint8_t animation_color = sanitize_logo_color(g_logo_animation_color);
+        const uint8_t brightness = config_rlogo->brightness;
+        const uint8_t gradient_v = (brightness < 32) ? 32 : brightness;
+
+        auto fill_logo_color = [&](uint8_t r, uint8_t g, uint8_t b) {
+            for (uint16_t logical_index = 0; logical_index < logo_pixel_count; logical_index++)
+            {
+                uint16_t physical_index = map_logo_logical_to_physical(logical_index);
+                led_strip->set_color_index(physical_index, r, g, b);
+            }
+        };
+
+        switch (animation_mode)
         {
-            for (int j = 0; j < line_len; j++)
-            {
-                led_strip->set_color_index(sequence[(i + j) % sequence_len], config_rlogo->brightness, 0, 0);
-            }
-            led_strip->refresh();
-            vTaskDelay(100);
-            // 只需要关闭第一个灯
-            led_strip->set_color_index(sequence[i], 0, 0, 0);
-            led_strip->refresh();
-            // 接受任务通知检查是否重置
-            if (ulTaskNotifyTake(pdTRUE, 0))
-            {
-                // 重置
-                i = 0;
-                led_strip->clear_pixels();
-                led_strip->refresh();
-            }
+        case LOGO_ANIM_MONO_BREATH:
+        {
+            uint16_t tri = (mono_breath_phase < 256) ? mono_breath_phase : (511 - mono_breath_phase); // 0~255
+            uint8_t breath_level = (uint8_t)((tri * 191) / 255 + 64);                                  // 25%~100%
+            uint8_t value = (uint8_t)((uint16_t)brightness * breath_level / 255);
+            if (animation_color == PR_BLUE)
+                fill_logo_color(0, 0, value);
+            else
+                fill_logo_color(value, 0, 0);
+            mono_breath_phase = (mono_breath_phase + 4) & 0x01FF;
+            break;
         }
+        case LOGO_ANIM_SOLID:
+        {
+            if (animation_color == PR_BLUE)
+                fill_logo_color(0, 0, brightness);
+            else
+                fill_logo_color(brightness, 0, 0);
+            break;
+        }
+        case LOGO_ANIM_OFF:
+        {
+            fill_logo_color(0, 0, 0);
+            break;
+        }
+        case LOGO_ANIM_IDLE_FLOW_GRADIENT:
+        default:
+        {
+            for (uint16_t logical_index = 0; logical_index < logo_pixel_count; logical_index++)
+            {
+                uint8_t pixel_hue = (uint8_t)(base_hue + logical_index * 6 + flow_phase);
+                uint8_t r = 0, g = 0, b = 0;
+                hsv_to_rgb_u8(pixel_hue, 255, gradient_v, &r, &g, &b);
+                uint16_t physical_index = map_logo_logical_to_physical(logical_index);
+                led_strip->set_color_index(physical_index, r, g, b);
+            }
+            flow_phase += 2;
+            base_hue += 1;
+            break;
+        }
+        }
+
+        led_strip->refresh();
+
+        // 接受任务通知仅重置相位，避免清屏闪断
+        if (ulTaskNotifyTake(pdTRUE, 0))
+        {
+            mono_breath_phase = 0;
+            flow_phase = 0;
+            base_hue = 0;
+        }
+
+        vTaskDelay(20 / portTICK_PERIOD_MS);
     }
 }
 

@@ -45,13 +45,15 @@ enum LED_Strip_State_t
     LED_STRIP_TARGET,
     LED_STRIP_HIT,
     LED_STRIP_BLINK,
+    LED_STRIP_SUCCESS_STATIC,
+    LED_STRIP_SMALL_HIT_STATIC,
 };
 
 struct LED_Strip_FSM_t
 {
     RUNE_COLOR color = PR_RED;
     RUNE_MODE mode = PRA_RUNE_BIG_MODE;
-    LED_Strip_State_t LED_Strip_State = LED_STRIP_DEBUG;
+    LED_Strip_State_t LED_Strip_State = LED_STRIP_IDLE;
     uint8_t score = 0; // 默认值为0
 };
 
@@ -222,7 +224,7 @@ private:
     // GPIO ISR处理
     static void IRAM_ATTR GPIO_ISR_handler(void *arg);
     // 装甲板启动，含红蓝方和大小符
-    static inline void trigger(RUNE_MODE mode, RUNE_COLOR color);
+    static inline void trigger(RUNE_MODE mode, RUNE_COLOR color, uint8_t big_group_index = 1, uint8_t big_target_armed = 1);
     // 装甲板命中
     static inline void hit(uint8_t score);
     // 装甲板清除

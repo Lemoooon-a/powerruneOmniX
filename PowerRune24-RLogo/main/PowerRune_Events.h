@@ -77,6 +77,14 @@ enum RUNE_MODE
 {
     PRA_RUNE_BIG_MODE,
     PRA_RUNE_SMALL_MODE,
+    PRA_RUNE_SINGLE_TEST_MODE,
+    PRA_RUNE_ALL_TARGET_READY_MODE,
+    PRA_RUNE_ALL_SUCCESS_STATIC_MODE,
+    PRA_RUNE_SMALL_4_HIT_1_READY_TEST_MODE,
+    PRA_RUNE_SMALL_HIT_STATIC_MODE,
+    PRA_RUNE_BIG_PROGRESS_2_READY_TEST_MODE,
+    PRA_RUNE_SINGLE_SCORE_TEST_MODE,
+    PRA_RUNE_AUTO_SUCCESS_MODE,
 };
 
 enum RUNE_COLOR
@@ -98,6 +106,10 @@ struct PRA_START_EVENT_DATA
     uint8_t data_len = sizeof(PRA_START_EVENT_DATA);
     uint8_t mode = PRA_RUNE_BIG_MODE;
     uint8_t color = PR_RED;
+    // 大符模式组号(1~5)，用于同步进度条
+    uint8_t big_group_index = 1;
+    // 当前叶片待击打标志(1=本轮待击打，0=仅显示辅助灯效/暗态)
+    uint8_t big_target_armed = 1;
 };
 
 struct PRA_STOP_EVENT_DATA

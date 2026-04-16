@@ -1,20 +1,40 @@
 #operation_buttons {
   layout: horizontal;
   align: left middle;
-  height: 5;
-  padding: 1;
+  height: auto;
+  padding: 1 1 0 1;
 }
 
-#start {
-  dock: left;
+#feature_buttons {
+  layout: grid;
+  grid-size: 2;
+  grid-columns: 1fr 1fr;
+  align: left middle;
+  height: auto;
+  padding: 0 1 1 1;
+}
+
+#func_all_target_ready {
+  width: 100%;
+}
+
+#func_all_success_static {
+  width: 100%;
+}
+
+#run_toggle {
+  width: 12;
 }
 
 #state {
-  display: none;
+  display: block;
+  align: left middle;
+  padding-left: 1;
 }
 
-#stop {
-  display: none;
+#score {
+  height: 12;
+  width: 100%;
 }
 
 #reset {
@@ -26,40 +46,34 @@
 }
 
 #start_params {
-  layout: horizontal;
-  height: 5;
+  layout: vertical;
+  height: auto;
+  padding: 0 1 1 1;
+}
+
+#debug_params_row {
+  layout: grid;
+  grid-size: 2;
+  grid-columns: 1fr 1fr;
+  width: 100%;
+  height: auto;
+  padding: 0 0 1 0;
+}
+
+#small_debug_params {
+  layout: vertical;
+  height: auto;
+  padding: 0 1 0 0;
+}
+
+#big_debug_params {
+  layout: vertical;
+  height: auto;
+  padding: 0 0 0 1;
 }
 
 #advanced_buttons {
   layout: horizontal;
   height: 5;
   padding: 1;
-}
-
-.started #start {
-  display: none;
-}
-
-.started #state {
-  align: center middle;
-  display: block;
-}
-
-.started #stop {
-  dock: left;
-  display: block;
-}
-
-.reconnect #start {
-  dock: left;
-  display: block;
-}
-
-.reconnect #state {
-  display: none;
-}
-
-.reconnect #stop {
-  dock: right;
-  display: block;
 }
